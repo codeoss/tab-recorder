@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Tab 录制大师 — 录制窗口</title>
+  <style>
+    :root{--bg:#12121a;--bg2:#1e1e2e;--ac:#ff4757;--acg:rgba(255,71,87,.3);--t1:#e8e8ef;--t2:#8888a0;--t3:#55556a;--ok:#2ed573;--wn:#ffa502;--bd:#2d2d40}
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--t1);display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:30px}
+
+    h2{font-size:18px;margin-bottom:8px;font-weight:600}
+    .sub{font-size:13px;color:var(--t2);margin-bottom:24px;text-align:center;line-height:1.5}
+
+    .start-btn{padding:14px 36px;border-radius:12px;border:2px solid var(--ac);background:rgba(255,71,87,.1);color:var(--ac);font-size:16px;font-weight:700;cursor:pointer;font-family:inherit;transition:.2s}
+    .start-btn:hover{background:rgba(255,71,87,.2);box-shadow:0 0 20px var(--acg)}
+
+    .rec-panel{display:none;flex-direction:column;align-items:center;gap:12px}
+    .rec-panel.on{display:flex}
+    .timer{font-size:36px;font-weight:700;font-family:'Courier New',monospace;letter-spacing:3px;color:var(--ac)}
+    .timer-sub{font-size:13px;color:var(--t3);font-family:'Courier New',monospace}
+    .pw{width:260px;height:4px;background:var(--bg2);border-radius:3px;overflow:hidden}
+    .pb{height:100%;background:var(--ac);border-radius:3px;width:0;transition:width .3s}
+    .btns{display:flex;gap:10px;margin-top:8px}
+    .btn{padding:8px 22px;border-radius:8px;border:1px solid var(--bd);background:var(--bg2);color:var(--t1);font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:.2s}
+    .btn:hover{background:#2a2a3a}
+    .btn.stop{border-color:var(--ac);color:var(--ac)}.btn.stop:hover{background:rgba(255,71,87,.1)}
+    .status{font-size:12px;color:var(--t2);margin-top:10px}
+    .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ac);margin-right:6px;animation:blink 1s infinite}
+    .dot.paused{background:var(--wn);animation:none}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+    .size{font-size:11px;color:var(--t3);margin-top:4px}
+    .hidden{display:none!important}
+    .err{color:var(--ac);font-size:13px;margin-top:12px;text-align:center}
+  </style>
+</head>
+<body>
+  <!-- 阶段一：开始屏 -->
+  <div id="startScreen">
+    <h2 id="title">🖥️ 录制窗口 / 屏幕</h2>
+    <p class="sub" id="subtitle">点击下方按钮选择要录制的内容<br>此窗口可最小化，录制不会中断</p>
+    <button class="start-btn" id="startBtn">选择并开始录制</button>
+    <div class="err hidden" id="errMsg"></div>
+  </div>
+
+  <!-- 阶段二：录制面板 -->
+  <div class="rec-panel" id="recPanel">
+    <div class="timer" id="timer">00:00:00</div>
+    <div class="timer-sub hidden" id="limitTxt"></div>
+    <div class="pw hidden" id="pWrap"><div class="pb" id="pBar"></div></div>
+    <div class="status"><span class="dot" id="dot"></span><span id="stxt">录制中</span></div>
+    <div class="size" id="sizeInfo"></div>
+    <div class="btns">
+      <button class="btn" id="pauseBtn">⏸ 暂停</button>
+      <button class="btn stop" id="stopBtn">⏹ 停止并保存</button>
+    </div>
+  </div>
+
+  <script src="fix-webm.js"></script>
+  <script src="transcoder.js"></script>
+  <script src="recorder.js"></script>
+</body>
+</html>

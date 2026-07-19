@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Tab 录制大师</title>
+  <style>
+    :root{--bg:#0f0f13;--bg2:#22222e;--bg3:#2a2a3a;--ac:#ff4757;--acg:rgba(255,71,87,.3);--ac2:#5352ed;--t1:#e8e8ef;--t2:#8888a0;--t3:#55556a;--bd:#2d2d40;--ok:#2ed573;--wn:#ffa502;--r:10px}
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{width:380px;min-height:400px;font-family:-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--t1);overflow-x:hidden}
+
+    .hdr{padding:16px 20px 12px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--bd)}
+    .logo{display:flex;align-items:center;gap:9px}
+    .logo-i{width:28px;height:28px;background:linear-gradient(135deg,var(--ac),var(--ac2));border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:14px}
+    .logo-t{font-size:15px;font-weight:700}.logo-t b{color:var(--ac)}
+    .badge{font-size:10px;padding:3px 8px;border-radius:20px;background:rgba(46,213,115,.15);color:var(--ok);font-weight:600}
+
+    .ct{padding:14px 20px}
+    .sl{font-size:10px;font-weight:600;color:var(--t2);text-transform:uppercase;letter-spacing:1px;margin-bottom:7px}
+
+    .sg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;margin-bottom:14px}
+    .sb{background:var(--bg2);border:2px solid var(--bd);border-radius:var(--r);padding:11px 6px;color:var(--t1);cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:4px;transition:.2s;font-family:inherit;font-size:0}
+    .sb:hover{background:var(--bg3);border-color:var(--t3)}
+    .sb.on{border-color:var(--ac);background:rgba(255,71,87,.08)}
+    .sb .ic{font-size:19px}.sb .lb{font-size:10px;font-weight:500;color:var(--t2)}.sb.on .lb{color:var(--ac)}
+
+    .og{margin-bottom:14px}
+    .or{display:flex;align-items:center;justify-content:space-between;padding:9px 12px;background:var(--bg2);border-radius:var(--r);margin-bottom:4px}
+    .ol{display:flex;align-items:center;gap:8px}
+    .oi{font-size:14px}.ot{font-size:12px;font-weight:500}
+    .hint{font-size:10px;color:var(--t3);margin-left:4px}
+
+    .tg{position:relative;width:36px;height:20px;cursor:pointer;flex-shrink:0}
+    .tg input{opacity:0;width:0;height:0}
+    .ts{position:absolute;inset:0;background:var(--bg3);border-radius:20px;transition:.25s}
+    .ts::before{content:'';position:absolute;width:14px;height:14px;left:3px;top:3px;background:var(--t2);border-radius:50%;transition:.25s}
+    .tg input:checked+.ts{background:var(--ac)}
+    .tg input:checked+.ts::before{transform:translateX(16px);background:#fff}
+
+    .sw{position:relative}
+    .cs{background:var(--bg3);border:1px solid var(--bd);border-radius:6px;color:var(--t1);padding:4px 22px 4px 8px;font-size:11px;font-family:inherit;cursor:pointer;appearance:none}
+    .sw::after{content:'▾';position:absolute;right:7px;top:50%;transform:translateY(-50%);color:var(--t3);font-size:9px;pointer-events:none}
+
+    .tlr{display:flex;align-items:center;gap:5px}
+    .tli{width:44px;background:var(--bg3);border:1px solid var(--bd);border-radius:6px;color:var(--t1);padding:4px 5px;font-size:11px;font-family:inherit;text-align:center}
+    .tli:focus{outline:none;border-color:var(--ac)}
+    .tli::-webkit-inner-spin-button{-webkit-appearance:none}
+    .tlu{font-size:10px;color:var(--t2)}
+
+    .ra{display:flex;flex-direction:column;align-items:center;padding:14px 0 6px}
+    .tm{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--t1);font-family:'Courier New',monospace;letter-spacing:2px}
+    .tm.on{color:var(--ac)}
+    .tm-sub{font-size:11px;color:var(--t3);margin-top:2px;font-family:'Courier New',monospace}
+    .pw{width:80%;height:3px;background:var(--bg3);border-radius:2px;margin-top:6px;overflow:hidden}
+    .pb{height:100%;background:var(--ac);border-radius:2px;width:0;transition:width .3s}
+
+    .rb{width:64px;height:64px;border-radius:50%;border:3px solid var(--ac);background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:.3s;margin-top:8px}
+    .rb::before{content:'';width:26px;height:26px;background:var(--ac);border-radius:50%;transition:.3s}
+    .rb:hover{box-shadow:0 0 20px var(--acg);transform:scale(1.06)}
+    .rb.rec{animation:pulse 1.5s ease-in-out infinite}
+    .rb.rec::before{width:20px;height:20px;border-radius:4px}
+    .rb.pau{border-color:var(--wn)}.rb.pau::before{background:var(--wn)}
+    @keyframes pulse{0%,100%{box-shadow:0 0 0 0 var(--acg)}50%{box-shadow:0 0 0 12px transparent}}
+
+    .rl{margin-top:7px;font-size:11px;color:var(--t2);font-weight:500}
+
+    .cb{display:flex;gap:8px;margin-top:10px}
+    .cbtn{padding:6px 16px;border-radius:7px;border:1px solid var(--bd);background:var(--bg2);color:var(--t1);font-size:11px;font-weight:600;cursor:pointer;font-family:inherit;display:flex;align-items:center;gap:5px;transition:.2s}
+    .cbtn:hover{background:var(--bg3)}
+    .cbtn.dg{border-color:var(--ac);color:var(--ac)}.cbtn.dg:hover{background:rgba(255,71,87,.1)}
+
+    .sbar{margin-top:12px;padding:8px 11px;background:var(--bg2);border-radius:var(--r);display:flex;align-items:center;gap:7px;font-size:11px;color:var(--t2)}
+    .sd{width:7px;height:7px;border-radius:50%;background:var(--t3);flex-shrink:0}
+    .sd.rdy{background:var(--ok)}.sd.rec{background:var(--ac);animation:blink 1s infinite}.sd.pau{background:var(--wn)}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+    .ir{display:flex;justify-content:space-between;margin-top:4px;font-size:10px;color:var(--t3);padding:0 4px}
+
+    .note{margin-top:4px;margin-bottom:4px;padding:8px 10px;background:rgba(83,82,237,.1);border:1px solid rgba(83,82,237,.2);border-radius:7px;font-size:11px;color:#7c7bf0;line-height:1.4}
+
+    .ft{padding:10px 20px;border-top:1px solid var(--bd);text-align:center;font-size:9px;color:var(--t3)}
+    .hidden{display:none!important}
+    .dis{opacity:.4;pointer-events:none}
+
+    .cdov{position:fixed;inset:0;background:rgba(15,15,19,.92);display:flex;align-items:center;justify-content:center;z-index:999}
+    .cdn{font-size:64px;font-weight:700;color:var(--ac)}
+
+    .hs{margin-top:12px}
+    .hi{padding:8px 10px;background:var(--bg2);border-radius:7px;margin-bottom:4px}
+    .rn{font-size:10px;font-weight:500}.rm{font-size:9px;color:var(--t3)}
+  </style>
+</head>
+<body>
+  <div class="hdr">
+    <div class="logo"><div class="logo-i">🎬</div><div class="logo-t">Tab<b>录制</b>大师</div></div>
+    <div class="badge">● 离线可用</div>
+  </div>
+
+  <div class="ct">
+    <div id="sp">
+      <div class="sl">录制来源</div>
+      <div class="sg">
+        <button class="sb on" data-source="tab"><span class="ic">📑</span><span class="lb">当前标签页</span></button>
+        <button class="sb" data-source="window"><span class="ic">🖥️</span><span class="lb">窗口</span></button>
+        <button class="sb" data-source="screen"><span class="ic">🖵</span><span class="lb">整个屏幕</span></button>
+      </div>
+
+      <div class="sl">分辨率与帧率</div>
+      <div class="og">
+        <div class="or">
+          <div class="ol"><span class="oi">📐</span><span class="ot">分辨率</span></div>
+          <div class="sw"><select class="cs" id="res">
+            <option value="1920x1080" selected>1080p (1920×1080)</option>
+            <option value="1280x720">720p (1280×720)</option>
+            <option value="2560x1440">1440p (2560×1440)</option>
+            <option value="3840x2160">4K (3840×2160)</option>
+            <option value="854x480">480p (854×480)</option>
+          </select></div>
+        </div>
+        <div class="or">
+          <div class="ol"><span class="oi">🎞️</span><span class="ot">帧率</span></div>
+          <div class="sw"><select class="cs" id="fps">
+            <option value="30" selected>30 fps</option>
+            <option value="24">24 fps</option>
+            <option value="60">60 fps</option>
+            <option value="15">15 fps</option>
+          </select></div>
+        </div>
+        <div class="or">
+          <div class="ol"><span class="oi">📊</span><span class="ot">视频比特率</span></div>
+          <div class="sw"><select class="cs" id="qual">
+            <option value="4000000">高清 (4 Mbps)</option>
+            <option value="8000000" selected>超清 (8 Mbps)</option>
+            <option value="16000000">极清 (16 Mbps)</option>
+          </select></div>
+        </div>
+      </div>
+
+      <div class="sl">录制选项</div>
+      <div class="og">
+        <div class="or" id="ptaRow">
+          <div class="ol"><span class="oi">🔈</span><span class="ot">录制时保持标签页声音</span></div>
+          <label class="tg"><input type="checkbox" id="pta" checked><span class="ts"></span></label>
+        </div>
+        <div class="or" id="compatRow">
+          <div class="ol"><span class="oi">☁️</span><span class="ot">云桌面兼容模式</span></div>
+          <label class="tg"><input type="checkbox" id="compat"><span class="ts"></span></label>
+        </div>
+        <div class="note hidden" id="compatNote">标签页画面仍精确录制，音频改从系统采集。<br>开始时会弹出控制窗口，请选择「整个屏幕」并勾选「分享系统音频」。标签页不会被静音。</div>
+        <div class="or" id="cdRow">
+          <div class="ol"><span class="oi">⏱️</span><span class="ot">倒计时</span></div>
+          <div class="sw"><select class="cs" id="cd">
+            <option value="0">无</option><option value="3" selected>3秒</option>
+            <option value="5">5秒</option><option value="10">10秒</option>
+          </select></div>
+        </div>
+        <div class="or">
+          <div class="ol"><span class="oi">📦</span><span class="ot">输出格式</span><span class="ot hint">MP4 需配置</span></div>
+          <div class="sw"><select class="cs" id="fmt">
+            <option value="webm" selected>WebM (VP9+Opus)</option>
+            <option value="mp4">MP4 (转码)</option>
+          </select></div>
+        </div>
+        <div class="or">
+          <div class="ol"><span class="oi">⏳</span><span class="ot">定时停止</span><span class="hint">0=不限</span></div>
+          <div class="tlr">
+            <input type="number" class="tli" id="tlH" min="0" max="99" value="0"><span class="tlu">时</span>
+            <input type="number" class="tli" id="tlM" min="0" max="59" value="0"><span class="tlu">分</span>
+            <input type="number" class="tli" id="tlS" min="0" max="59" value="0"><span class="tlu">秒</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="note hidden" id="deskNote">录制窗口/屏幕时会弹出独立控制窗口，可以最小化该窗口</div>
+    </div>
+
+    <div class="ra">
+      <div class="tm" id="timer">00:00:00</div>
+      <div class="tm-sub hidden" id="limTxt"></div>
+      <div class="pw hidden" id="pWrap"><div class="pb" id="pBar"></div></div>
+      <button class="rb" id="recBtn"></button>
+      <div class="rl" id="recLabel">点击开始录制</div>
+      <div class="cb hidden" id="ctrls">
+        <button class="cbtn" id="pauseBtn">⏸ 暂停</button>
+        <button class="cbtn dg" id="discardBtn">🗑 丢弃</button>
+      </div>
+    </div>
+
+    <div class="sbar">
+      <span class="sd rdy" id="dot"></span>
+      <span id="stxt">就绪 — 关闭面板不影响录制</span>
+    </div>
+    <div class="ir"><span id="sizeInfo"></span><span id="fmtInfo">格式: WebM</span></div>
+
+    <div class="hs" id="hist"></div>
+  </div>
+
+  <div class="ft">Tab 录制大师 · 完全离线 · 无限时长 · 数据不上传</div>
+  <div class="cdov hidden" id="cdOvl"><div class="cdn" id="cdNum">3</div></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
