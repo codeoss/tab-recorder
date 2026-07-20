@@ -24,6 +24,7 @@ let limitMs  = 0;
 let flushTimer = null;
 let tickInterval = null;
 let isPaused = false;
+let isProcessing = false;       // onStopped 异步链进行中（fixWebM/转码/dl），关窗会丢视频
 let screenAudioStream = null;   // 兼容模式 getDisplayMedia 的系统音频流
 let outputFormat = 'webm';
 
@@ -77,9 +78,33 @@ startBtn.addEventListener('click', startRecording);
 pauseBtn.addEventListener('click', togglePause);
 stopBtn.addEventListener('click', stopRecording);
 
-// 关闭窗口 → 干净收尾
-window.addEventListener('beforeunload', () => {
-  if (recorder?.state !== 'inactive') doStop();
+/* ── 接收来自 background 的指令（popup 操作转发过来）─────────
+   把按钮事件和 background 消息统一到同一组函数，避免状态分裂。
+   desktop 模式下，popup 的暂停/停止/丢弃原本无法触达这个窗口，
+   这条通道补齐了「UI 显示暂停 ⇄ 真实 MediaRecorder 仍录制」的脱节。
+   ────────────────────────────────────────────────────────── */
+chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+  const handlers = {
+    OFF_STOP:    () => { stopRecording(); return { ok: 1 }; },
+    OFF_PAUSE:   () => { doPause();       return { ok: 1 }; },
+    OFF_RESUME:  () => { doResume();      return { ok: 1 }; },
+    OFF_DISCARD: () => { doDiscard();     return { ok: 1 }; },
+  };
+  const fn = handlers[msg.type];
+  if (!fn) return false;
+  reply(fn());
+  return false;
+});
+
+// 关闭窗口：录制中/处理中时提示会丢视频（onStopped 是异步链，关窗即中断）
+// 现代浏览器忽略自定义文案，但仍需返回非空字符串才会弹原生确认框。
+window.addEventListener('beforeunload', e => {
+  const recording = recorder && recorder.state !== 'inactive';
+  if (recording || isProcessing) {
+    e.preventDefault();
+    e.returnValue = '录制尚未停止并保存，关闭窗口将丢失视频。';
+    return e.returnValue;
+  }
 });
 
 /* ── 开始录制 ────────────────────────────────────────── */
@@ -109,8 +134,15 @@ async function startRecording() {
   recorder.onstop = () => onStopped();
 
   // Chrome 原生「停止共享」条 → 干净收尾
-  stream.getVideoTracks()[0]?.addEventListener('ended', () => {
-    if (recorder?.state !== 'inactive') stopRecording();
+  // 监听录制流的所有轨道：
+  //   - 普通桌面模式：视频轨 ended 即可
+  //   - 兼容模式：视频来自 tabCapture、音频来自 getDisplayMedia，
+  //     用户点「停止共享」只会让 getDisplayMedia 的音频轨 ended，
+  //     必须监听音频轨才能捕获，否则录制继续但从此刻起没声音
+  recStream.getTracks().forEach(t => {
+    t.addEventListener('ended', () => {
+      if (recorder?.state !== 'inactive') stopRecording();
+    });
   });
 
   recorder.start(1000);
@@ -210,32 +242,64 @@ function stopRecording() {
 }
 function doStop() { stopRecording(); }
 
-/* ── 暂停 / 恢复 ─────────────────────────────────────── */
+/* ── 暂停 / 恢复 / 丢弃 ───────────────────────────────────
+   doPause/doResume/doDiscard 是「明确语义」版本，既被按钮（togglePause）
+   也被 background 消息调用，保证 popup 操作和窗口内操作走同一逻辑。
+   ────────────────────────────────────────────────────────── */
+
+function doPause() {
+  if (!recorder || isPaused || recorder.state !== 'recording') return;
+  recorder.pause(); isPaused = true; pauseTs = Date.now(); stopTick();
+  if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+  if (pauseBtn) pauseBtn.textContent = '▶ 继续';
+  if (dot) dot.classList.add('paused');
+  if (stxt) stxt.textContent = '已暂停';
+}
+
+function doResume() {
+  if (!recorder || !isPaused || recorder.state !== 'paused') return;
+  pausedMs += Date.now() - pauseTs; recorder.resume(); isPaused = false; startTick();
+  if (limitMs > 0) {
+    const rem = limitMs - elapsed();
+    if (rem > 0) stopTimer = setTimeout(() => stopRecording(), rem);
+    else return stopRecording();
+  }
+  if (pauseBtn) pauseBtn.textContent = '⏸ 暂停';
+  if (dot) dot.classList.remove('paused');
+  if (stxt) stxt.textContent = '录制中';
+}
+
+function doDiscard() {
+  chunks = [];
+  if (stopTimer)  { clearTimeout(stopTimer);  stopTimer = null; }
+  if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
+  if (recorder && recorder.state !== 'inactive') {
+    recorder.ondataavailable = null;
+    recorder.onstop = null;
+    try { recorder.stop(); } catch (_) {}
+  }
+  releaseAll();
+  notifyBg('RECORDER_STOPPED', { historyEntry: null });
+  setTimeout(() => window.close(), 100);   // 等 message 发出再关窗
+}
 
 function togglePause() {
   if (!recorder) return;
-  if (!isPaused && recorder.state === 'recording') {
-    recorder.pause(); isPaused = true; pauseTs = Date.now(); stopTick();
-    if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
-    pauseBtn.textContent = '▶ 继续';
-    dot.classList.add('paused'); stxt.textContent = '已暂停';
-  } else if (isPaused && recorder.state === 'paused') {
-    pausedMs += Date.now() - pauseTs; recorder.resume(); isPaused = false; startTick();
-    if (limitMs > 0) {
-      const rem = limitMs - elapsed();
-      if (rem > 0) stopTimer = setTimeout(() => stopRecording(), rem);
-      else stopRecording();
-    }
-    pauseBtn.textContent = '⏸ 暂停';
-    dot.classList.remove('paused'); stxt.textContent = '录制中';
-  }
+  if (!isPaused) doPause();
+  else doResume();
 }
 
 /* ── 录制结束 ────────────────────────────────────────── */
 
 async function onStopped() {
   releaseAll(); stopTick();
-  if (!chunks.length) { notifyBg('RECORDER_STOPPED', { historyEntry: null }); window.close(); return; }
+  isProcessing = true;   // 进入异步保存链：期间关窗会丢视频，beforeunload 要拦
+  if (!chunks.length) {
+    isProcessing = false;
+    notifyBg('RECORDER_STOPPED', { historyEntry: null });
+    window.close();
+    return;
+  }
 
   stxt.textContent = '处理中...';
   dot.style.animation = 'none';
@@ -262,6 +326,7 @@ async function onStopped() {
     format: finalBlob.type.includes('mp4') ? 'mp4' : 'webm',
   } });
 
+  isProcessing = false;   // 保存完成，允许关窗
   stxt.textContent = '已保存: ' + filename;
   setTimeout(() => window.close(), 2000);
 }
