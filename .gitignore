@@ -1,0 +1,96 @@
+# ─────────────────────────────────────────────
+# Tab 录制大师 — Chrome 扩展 .gitignore
+# ─────────────────────────────────────────────
+
+# ===== ffmpeg.wasm 内核（按 README 手动放入，不进版本库）=====
+# 体积约 30MB，版权/体积原因不随扩展打包；保留 README.txt
+#lib/ffmpeg/ffmpeg-core.js
+#lib/ffmpeg/ffmpeg-core.wasm
+#lib/ffmpeg/ffmpeg-core.worker.js
+#lib/ffmpeg/*.wasm
+
+# ===== Node.js / npm（启用 MP4 转码时才会用到）=====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.npm/
+.pnpm-store/
+
+# ===== 录制输出（开发/测试时可能落地的音视频文件）=====
+*.webm
+*.mp4
+*.mkv
+*.ogg
+*.wav
+*.mp3
+recordings/
+output/
+
+# ===== 构建产物 / 打包输出 =====
+dist/
+build/
+*.zip
+*.crx               # Chrome 扩展打包产物
+*.pem               # 扩展签名私钥
+
+# ===== 运行时 / 临时文件 =====
+*.log
+logs/
+.cache/
+.tmp/
+tmp/
+*.tmp
+*.swp
+*.swo
+*~
+
+# ===== 操作系统 =====
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# ===== 编辑器 / IDE =====
+# VSCode（保留项目级 .vscode/settings.json 可考虑，默认忽略）
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+# Sublime / Vim / Emacs
+*.sublime-workspace
+*.sublime-project
+.netrwhist
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+
+# ===== 安全 / 凭证（切勿提交）=====
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+secrets/
