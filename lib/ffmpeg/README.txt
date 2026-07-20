@@ -15,8 +15,9 @@ lib/ffmpeg/
       transcoder-worker.js 这个 Web Worker 里，转码期间 UI 不卡。）
   3. 在扩展弹窗中「输出格式」选择 MP4，重新加载扩展。
 
-manifest.json 已配好 wasm-unsafe-eval CSP 和 web_accessible_resources，
-无需手动调整。
+manifest.json 已配好 MV3 跑 wasm 必需的 wasm-unsafe-eval CSP，无需手动调整。
+不要加 web_accessible_resources：worker 和本目录的内核都是扩展页面同源加载，
+用不上 WAR；加了反而会把这些资源暴露给任意网页，让扩展可被指纹识别。
 
 补充：新版 Chrome 可原生录 MP4，本目录内核用于结束后 faststart
 （搬 moov 让进度条可拖）；老版本 Chrome 则用于整段转码。
