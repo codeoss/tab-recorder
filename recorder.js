@@ -24,6 +24,7 @@ let limitMs  = 0;
 let flushTimer = null;
 let tickInterval = null;
 let isPaused = false;
+let isProcessing = false;       // onStopped 异步链进行中（fixWebM/转码/dl），关窗会丢视频
 let screenAudioStream = null;   // 兼容模式 getDisplayMedia 的系统音频流
 let outputFormat = 'webm';
 
@@ -95,9 +96,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   return false;
 });
 
-// 关闭窗口 → 干净收尾
-window.addEventListener('beforeunload', () => {
-  if (recorder?.state !== 'inactive') doStop();
+// 关闭窗口：录制中/处理中时提示会丢视频（onStopped 是异步链，关窗即中断）
+// 现代浏览器忽略自定义文案，但仍需返回非空字符串才会弹原生确认框。
+window.addEventListener('beforeunload', e => {
+  const recording = recorder && recorder.state !== 'inactive';
+  if (recording || isProcessing) {
+    e.preventDefault();
+    e.returnValue = '录制尚未停止并保存，关闭窗口将丢失视频。';
+    return e.returnValue;
+  }
 });
 
 /* ── 开始录制 ────────────────────────────────────────── */
@@ -279,7 +286,13 @@ function togglePause() {
 
 async function onStopped() {
   releaseAll(); stopTick();
-  if (!chunks.length) { notifyBg('RECORDER_STOPPED', { historyEntry: null }); window.close(); return; }
+  isProcessing = true;   // 进入异步保存链：期间关窗会丢视频，beforeunload 要拦
+  if (!chunks.length) {
+    isProcessing = false;
+    notifyBg('RECORDER_STOPPED', { historyEntry: null });
+    window.close();
+    return;
+  }
 
   stxt.textContent = '处理中...';
   dot.style.animation = 'none';
@@ -306,6 +319,7 @@ async function onStopped() {
     format: finalBlob.type.includes('mp4') ? 'mp4' : 'webm',
   } });
 
+  isProcessing = false;   // 保存完成，允许关窗
   stxt.textContent = '已保存: ' + filename;
   setTimeout(() => window.close(), 2000);
 }
