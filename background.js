@@ -23,8 +23,39 @@ const state = {
   timeLimit: 0,            // 秒，0 = 不限
   mode: '',                // 'tab' | 'desktop'
   recorderWindowId: 0,
+  recorderTabId: 0,        // desktop 模式 recorder 窗口里的 tab id（用于转发指令）
   countdownRemaining: 0,
 };
+
+/* ═══════════════════════════════════════════════════════
+   状态持久化（MV3 SW 回收后状态不丢）
+
+   MV3 SW 空闲 ~30s 会被回收，唤醒后所有内存变量归零。
+   把 state 镜像到 chrome.storage.session：
+     - 写：任何变更都 fire-and-forget 写回
+     - 读：SW 脚本加载时立即发起恢复（不阻塞顶层），route 时 await
+   用 session 而非 local：录制状态是会话级的，浏览器重启后不该残留。
+   ═══════════════════════════════════════════════════════ */
+
+const STATE_KEY = 'recorderState';
+
+/** 统一的状态变更入口：改完立即持久化。 */
+function setState(patch) {
+  Object.assign(state, patch);
+  chrome.storage.session.set({ [STATE_KEY]: state }).catch(() => {});
+}
+
+/** SW 启动时异步恢复 state；返回 Promise。 */
+function restoreState() {
+  return chrome.storage.session.get(STATE_KEY).then(d => {
+    if (d[STATE_KEY] && typeof d[STATE_KEY] === 'object') {
+      Object.assign(state, d[STATE_KEY]);
+    }
+  }).catch(() => {});
+}
+
+// 顶层立即发起恢复；route() 会 await 它
+const stateReady = restoreState();
 
 /* ═══════════════════════════════════════════════════════
    Offscreen 生命周期
@@ -53,6 +84,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
 });
 
 async function route(msg) {
+  await stateReady;   // 确保 SW 回收后已恢复 state
   switch (msg.type) {
 
     /* ── 开始录制（来自 popup）────────────────────────── */
@@ -69,7 +101,7 @@ async function route(msg) {
       } else if (state.mode === 'desktop' && state.recorderWindowId) {
         try { chrome.windows.remove(state.recorderWindowId); } catch (_) {}
       }
-      state.status = 'idle'; badge('idle');
+      setState({ status: 'idle' }); badge('idle');
       return { ok: 1 };
     }
 
@@ -78,7 +110,7 @@ async function route(msg) {
       if (state.mode === 'tab') {
         await chrome.runtime.sendMessage({ type: 'OFF_PAUSE', target: 'offscreen' });
       }
-      state.status = 'paused'; state.pauseStart = Date.now();
+      setState({ status: 'paused', pauseStart: Date.now() });
       badge('paused');
       return { ok: 1 };
     }
@@ -86,8 +118,11 @@ async function route(msg) {
       if (state.mode === 'tab') {
         await chrome.runtime.sendMessage({ type: 'OFF_RESUME', target: 'offscreen' });
       }
-      state.pausedTime += Date.now() - state.pauseStart;
-      state.status = 'recording'; badge('recording');
+      setState({
+        pausedTime: state.pausedTime + (Date.now() - state.pauseStart),
+        status: 'recording',
+      });
+      badge('recording');
       return { ok: 1 };
     }
 
@@ -98,7 +133,7 @@ async function route(msg) {
       } else if (state.recorderWindowId) {
         try { chrome.windows.remove(state.recorderWindowId); } catch (_) {}
       }
-      state.status = 'idle'; state.fileSize = 0; badge('idle');
+      setState({ status: 'idle', fileSize: 0 }); badge('idle');
       return { ok: 1 };
     }
 
@@ -109,24 +144,25 @@ async function route(msg) {
     /* ── 来自 offscreen / recorder 的事件 ─────────────── */
     case 'RECORDING_STOPPED':
     case 'RECORDER_STOPPED': {
-      state.status = 'idle'; state.fileSize = 0;
-      state.recorderWindowId = 0;
+      setState({ status: 'idle', fileSize: 0, recorderWindowId: 0 });
       badge('idle');
       if (msg.historyEntry) saveHistory(msg.historyEntry);
       return { ok: 1 };
     }
     case 'RECORDER_STARTED': {
-      state.status = 'recording';
-      state.startTime = Date.now();
-      state.pausedTime = 0;
+      setState({
+        status: 'recording',
+        startTime: Date.now(),
+        pausedTime: 0,
+      });
       badge('recording');
       return { ok: 1 };
     }
     case 'FILE_SIZE_UPDATE':
-      state.fileSize = msg.size || 0;
+      setState({ fileSize: msg.size || 0 });
       return { ok: 1 };
     case 'COUNTDOWN_TICK':
-      state.countdownRemaining = msg.remaining || 0;
+      setState({ countdownRemaining: msg.remaining || 0 });
       return { ok: 1 };
 
     default:
@@ -147,8 +183,7 @@ async function startTabRecording(msg) {
   // MV3 取 streamId，offscreen 用 chromeMediaSourceId 消费它
   const streamId = await getStreamId(tab.id);
 
-  state.status = 'countdown';
-  state.mode = 'tab';
+  setState({ status: 'countdown', mode: 'tab' });
 
   const result = await chrome.runtime.sendMessage({
     type: 'OFF_START',
@@ -166,7 +201,7 @@ async function startTabRecording(msg) {
 
   if (result?.error) throw new Error(result.error);
 
-  Object.assign(state, {
+  setState({
     status: 'recording',
     startTime: Date.now(),
     pausedTime: 0, pauseStart: 0, fileSize: 0,
@@ -229,13 +264,15 @@ async function openRecorderWindow(params, timeLimit) {
     focused: true,
   });
 
-  state.mode = 'desktop';
-  state.recorderWindowId = win.id;
-  state.status = 'recording';
-  state.startTime = Date.now();
-  state.pausedTime = 0;
-  state.fileSize = 0;
-  state.timeLimit = timeLimit || 0;
+  setState({
+    mode: 'desktop',
+    recorderWindowId: win.id,
+    status: 'recording',
+    startTime: Date.now(),
+    pausedTime: 0,
+    fileSize: 0,
+    timeLimit: timeLimit || 0,
+  });
   badge('recording');
 
   // 用户关闭录制窗口 → 归位状态
@@ -243,8 +280,7 @@ async function openRecorderWindow(params, timeLimit) {
     if (windowId === win.id) {
       chrome.windows.onRemoved.removeListener(listener);
       if (state.status !== 'idle') {
-        state.status = 'idle';
-        state.recorderWindowId = 0;
+        setState({ status: 'idle', recorderWindowId: 0 });
         badge('idle');
       }
     }
