@@ -23,7 +23,7 @@
  *
  * 依赖（调用方 HTML 里要先加载）：
  *   fix-webm.js → fixWebMBlob
- *   transcoder.js → webmToMp4 （仅 MP4 输出时用）
+ *   transcoder.js → webmToMp4（webm 转 mp4 时用）/ mp4Faststart（原生 mp4 修 faststart 时用）
  */
 
 (function (G) {
@@ -165,8 +165,16 @@
       let finalBlob = blob;
 
       if (recordedIsMp4) {
-        // 原生 MP4 录制：文件本身完整，无需 fixWebM 也无需转码
-        // （MP4 的 moov atom 由 MediaRecorder 写好，可拖动进度条）
+        // 原生 MP4 录制：文件能播放，但 Chrome 的 MediaRecorder 把 moov atom
+        // 写在末尾，导致播放器必须下载完整文件才能 seek（进度条拖不动）。
+        // 用 ffmpeg -c copy -movflags +faststart 把 moov 搬到开头（流复制，
+        // 不重编码，比转码快一个数量级）。失败则回退到原始 blob（能播不能拖）。
+        // TODO(额外C): ffmpeg.wasm 走 callMain 同步阻塞主线程，后续切 worker 版。
+        try {
+          finalBlob = await mp4Faststart(blob);
+        } catch (e) {
+          console.warn('MP4 faststart 失败，保留原始文件（进度条可能拖不动）：', e);
+        }
       } else {
         // WebM：补 Cues 索引 + Duration，使其可拖动进度条
         try { blob = await fixWebMBlob(blob, durMs); } catch (e) { console.warn(e); }

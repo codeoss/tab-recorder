@@ -79,5 +79,38 @@
     return new Blob([out], { type: 'video/mp4' });
   }
 
+  /**
+   * 把原生 MediaRecorder 录的 MP4 重包装为 faststart（moov atom 搬到开头）。
+   * 用 -c copy 不重编码，只搬 moov，速度比转码快一个数量级。
+   * 失败抛错（调用方可回退到原始 blob，文件能播放但不能拖动进度条）。
+   *
+   * 为什么需要：Chrome MediaRecorder 录的 MP4 通常把 moov 写在文件末尾，
+   * 播放器必须等整个文件下载完才能 seek。faststart 把 moov 搬到开头，
+   * 进度条才能正常拖动。
+   */
+  async function mp4Faststart(blob) {
+    const core = await loadFFmpeg();
+
+    const inName = 'in.mp4';
+    const outName = 'out.mp4';
+
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    core.FS.writeFile(inName, buf);
+
+    // -c copy：流复制，不重编码（H.264/AAC 原样保留）
+    // -movflags +faststart：把 moov atom 从末尾搬到开头
+    const code = core.callMain
+      ? core.callMain(['-i', inName, '-c', 'copy', '-movflags', '+faststart', outName])
+      : core.exec(['-i', inName, '-c', 'copy', '-movflags', '+faststart', outName]);
+    if (typeof code === 'number' && code !== 0) throw new Error('ffmpeg 退出码 ' + code);
+
+    const out = core.FS.readFile(outName);
+    core.FS.unlink(inName);
+    try { core.FS.unlink(outName); } catch (_) {}
+
+    return new Blob([out], { type: 'video/mp4' });
+  }
+
   G.webmToMp4 = webmToMp4;
+  G.mp4Faststart = mp4Faststart;
 })(self);
