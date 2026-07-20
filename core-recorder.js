@@ -23,7 +23,7 @@
  *
  * 依赖（调用方 HTML 里要先加载）：
  *   fix-webm.js → fixWebMBlob
- *   transcoder.js → webmToMp4 （仅 MP4 输出时用）
+ *   transcoder.js → webmToMp4（webm 转 mp4 时用）/ mp4Faststart（原生 mp4 修 faststart 时用）
  */
 
 (function (G) {
@@ -43,6 +43,7 @@
     let activeStream = null;     // getStream 返回的主流，core 自行管理释放
     let chunks = [];
     let mime = '';
+    let recordedIsMp4 = false;   // 录制是否用原生 MP4（决定 onStopped 是否还要转码）
     let startTs = 0;
     let pausedMs = 0;
     let pauseTs = 0;
@@ -66,7 +67,9 @@
       if (!recStream) return false;   // 取流失败，调用方已在 onEvent('error') 上报
       activeStream = recStream;
 
-      mime = pickFormat();
+      const fmt = pickFormat(outputFormat);
+      mime = fmt.mime;
+      recordedIsMp4 = fmt.isMp4;
       chunks = [];
       recorder = new MediaRecorder(recStream, {
         mimeType: mime,
@@ -157,23 +160,37 @@
       let blob = new Blob(chunks, { type: mime });
       chunks = [];
 
-      // WebM：补 Cues 索引 + Duration，使其可拖动进度条
-      try { blob = await fixWebMBlob(blob, durMs); } catch (e) { console.warn(e); }
-
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      let filename = `TabRecord_${ts}.webm`;
+      let filename = recordedIsMp4 ? `TabRecord_${ts}.mp4` : `TabRecord_${ts}.webm`;
       let finalBlob = blob;
 
-      // 可选 MP4 转码
-      // TODO(额外C): 当前 ffmpeg.wasm 走 callMain 同步阻塞主线程，转码期间
-      //   引擎无法响应任何消息。后续应切到 @ffmpeg/ffmpeg 的 worker 版。
-      //   现阶段靠 onEvent('processing') 让 UI 提示「转码中请勿关闭」。
-      if (outputFormat === 'mp4') {
+      if (recordedIsMp4) {
+        // 原生 MP4 录制：文件能播放，但 Chrome 的 MediaRecorder 把 moov atom
+        // 写在末尾，导致播放器必须下载完整文件才能 seek（进度条拖不动）。
+        // 用 ffmpeg -c copy -movflags +faststart 把 moov 搬到开头（流复制，
+        // 不重编码，比转码快一个数量级）。失败则回退到原始 blob（能播不能拖）。
+        // TODO(额外C): ffmpeg.wasm 走 callMain 同步阻塞主线程，后续切 worker 版。
         try {
-          finalBlob = await webmToMp4(blob);
-          filename = `TabRecord_${ts}.mp4`;
+          finalBlob = await mp4Faststart(blob);
         } catch (e) {
-          console.warn('MP4 转码失败，回退 WebM：', e);
+          console.warn('MP4 faststart 失败，保留原始文件（进度条可能拖不动）：', e);
+        }
+      } else {
+        // WebM：补 Cues 索引 + Duration，使其可拖动进度条
+        try { blob = await fixWebMBlob(blob, durMs); } catch (e) { console.warn(e); }
+        finalBlob = blob;
+
+        // 用户要 MP4 但原生不支持 → ffmpeg.wasm 转码
+        // TODO(额外C): 当前 ffmpeg.wasm 走 callMain 同步阻塞主线程，转码期间
+        //   引擎无法响应任何消息。后续应切到 @ffmpeg/ffmpeg 的 worker 版。
+        //   现阶段靠 onEvent('processing') 让 UI 提示「转码中请勿关闭」。
+        if (outputFormat === 'mp4') {
+          try {
+            finalBlob = await webmToMp4(blob);
+            filename = `TabRecord_${ts}.mp4`;
+          } catch (e) {
+            console.warn('MP4 转码失败，回退 WebM：', e);
+          }
         }
       }
 
@@ -207,10 +224,29 @@
 
     function elapsed() { return Date.now() - startTs - pausedMs; }
 
-    function pickFormat() {
+    /**
+     * 选 MediaRecorder mimeType。
+     *   - 用户要 mp4 时，优先尝试原生 MP4 支持（Chrome 130+ 的 avc1/mp4a），
+     *     不行再回退 webm（onStopped 时再走 ffmpeg 转码）。
+     *   - 用户要 webm 时，走原 VP9/VP8 链。
+     * 返回 { mime, isMp4 }：isMp4 表示是否真正用原生 MP4 录制。
+     */
+    function pickFormat(outputFormat) {
+      if (outputFormat === 'mp4') {
+        // Chrome 130+ 支持 video/mp4;codecs=avc1,mp4a（H.264 + AAC）
+        // avc1.42E01E = H.264 Baseline 3.0，兼容性最好；mp4a.40.2 = AAC-LC
+        for (const t of [
+          'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+          'video/mp4;codecs=avc1,mp4a',
+          'video/mp4',
+        ]) {
+          if (MediaRecorder.isTypeSupported(t)) return { mime: t, isMp4: true };
+        }
+        // 原生不支持 → 回退 webm，onStopped 时转码
+      }
       for (const t of ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'])
-        if (MediaRecorder.isTypeSupported(t)) return t;
-      return 'video/webm';
+        if (MediaRecorder.isTypeSupported(t)) return { mime: t, isMp4: false };
+      return { mime: 'video/webm', isMp4: false };
     }
 
     function reportSize() {
