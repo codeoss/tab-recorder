@@ -68,7 +68,12 @@ if (isCompatMode) {
 /* ── 事件 ────────────────────────────────────────────── */
 
 startBtn.addEventListener('click', startRecording);
-pauseBtn.addEventListener('click', () => engine && engine.pause());
+// 暂停按钮是 toggle：文案会随 paused/resumed 事件翻转，点击按当前态切换
+pauseBtn.addEventListener('click', () => {
+  if (!engine) return;
+  if (engine.isPaused()) engine.resume();
+  else engine.pause();
+});
 stopBtn.addEventListener('click',  () => engine && engine.stop());
 
 /* ── 接收来自 background 的指令（popup 操作转发过来）─────────

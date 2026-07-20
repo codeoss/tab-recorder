@@ -49,7 +49,7 @@
     let stopTimer = null;
     let flushTimer = null;
     let tickInterval = null;
-    let isPaused = false;
+    let paused_ = false;        // 是否处于暂停态（内部状态，外部用 isPaused() 查询）
     let isProcessing = false;   // onStopped 异步链进行中：关窗会丢视频
     let limitMs = 0;
     let outputFormat = 'webm';
@@ -89,7 +89,7 @@
       recorder.start(1000);
       startTs = Date.now();
       pausedMs = 0;
-      isPaused = false;
+      paused_ = false;
 
       emit('started', { timeLimit: opts.timeLimit || 0 });
       startTick();
@@ -108,16 +108,16 @@
     }
 
     function pause() {
-      if (!recorder || isPaused || recorder.state !== 'recording') return;
-      recorder.pause(); isPaused = true; pauseTs = Date.now(); stopTick();
+      if (!recorder || paused_ || recorder.state !== 'recording') return;
+      recorder.pause(); paused_ = true; pauseTs = Date.now(); stopTick();
       if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
       emit('paused');
     }
 
     function resume() {
-      if (!recorder || !isPaused || recorder.state !== 'paused') return;
+      if (!recorder || !paused_ || recorder.state !== 'paused') return;
       pausedMs += Date.now() - pauseTs;
-      recorder.resume(); isPaused = false; startTick();
+      recorder.resume(); paused_ = false; startTick();
       if (limitMs > 0) {
         const rem = limitMs - elapsed();
         if (rem > 0) stopTimer = setTimeout(() => stop(), rem);
@@ -249,7 +249,7 @@
 
     return {
       start, stop, pause, resume, discard,
-      isRecording, isBusy,
+      isRecording, isBusy, isPaused: () => paused_,
     };
   }
 
