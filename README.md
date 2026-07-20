@@ -37,7 +37,8 @@ tab-recorder-ext/
 ├── popup.html            # 主弹窗 UI
 ├── popup.js              # UI 控制器 + 状态轮询
 ├── fix-webm.js           # EBML 修复（补 Cues/Duration，使 WebM 可拖动）
-├── transcoder.js         # ffmpeg.wasm 封装：webmToMp4(blob)
+├── transcoder.js         # ffmpeg.wasm 主线程入口：webmToMp4(blob) / mp4Faststart(blob)
+├── transcoder-worker.js  # Web Worker 宿主：在独立线程跑 ffmpeg，主线程不阻塞
 ├── icons/{16,48,128}.png
 └── lib/ffmpeg/           # 可选：ffmpeg.wasm 内核（见下）
 ```
@@ -83,9 +84,12 @@ npm i @ffmpeg/core@0.12.10
 把 `node_modules/@ffmpeg/core/dist/` 下的：
 - `ffmpeg-core.js`
 - `ffmpeg-core.wasm`
-- `ffmpeg-core.worker.js`
 
 复制到 `lib/ffmpeg/`，然后在弹窗「输出格式」选择 **MP4**，重新加载扩展即可。
+
+> 只需要这 2 个文件。`ffmpeg-core.worker.js` 不再需要——ffmpeg 现在跑在扩展自带的 `transcoder-worker.js` 里（独立的 Web Worker），转码期间 UI 完全不卡。
+
+> manifest.json 已经配好了 MV3 必需的 `wasm-unsafe-eval` CSP 和 `web_accessible_resources`，无需手动改。
 
 > 即便不启用 MP4，WebM 输出与全部录制功能均正常工作；转码失败会自动回退为 WebM。
 
