@@ -28,25 +28,23 @@
 'use strict';
 
 let corePromise = null;   // 单例 Promise，跨多次转码复用同一 core 实例
+let currentTaskId = 0;    // 当前正在跑的任务 id（callMain 同步阻塞期间 onmessage
+                          // 不会重入，同一时刻只有一个任务，进度回调据此带 id）
 
-/** 加载 ffmpeg-core（懒加载，主线程传 coreURL）。失败 reject。 */
+/** 加载 ffmpeg-core（懒加载，主线程传 coreURL）。失败 reject 并允许下次重试。 */
 function loadCore(coreURL) {
   if (corePromise) return corePromise;
   corePromise = (async () => {
+    // Worker 内不能用 <script>，用 importScripts 加载 UMD 入口
     try {
-      // Worker 内不能用 <script>，用 importScripts 加载 UMD 入口
       importScripts(coreURL);
     } catch (e) {
-      corePromise = null;   // 允许下次重试
       throw new Error('ffmpeg-core.js 加载失败：' + (e && e.message || e));
     }
 
     // @ffmpeg/core 0.12 的导出名因版本而异，全部兜底
     const FF = self.FFmpegWASM || self.FFmpegCore || self.createFFmpegCore || self.FFmpeg;
-    if (!FF) {
-      corePromise = null;
-      throw new Error('未找到 ffmpeg-core 导出，请确认 @ffmpeg/core 版本');
-    }
+    if (!FF) throw new Error('未找到 ffmpeg-core 导出，请确认 @ffmpeg/core 版本');
 
     // coreURL 形如 chrome-extension://<id>/lib/ffmpeg/ffmpeg-core.js
     // locateFile 需要目录路径（用来找 .wasm）
@@ -57,17 +55,24 @@ function loadCore(coreURL) {
       locateFile: (path) => base + path,
     });
 
-    // 接 core 的进度回调（本次暂不接 UI，留作未来扩展）
+    // 接 core 的进度回调，转发给主线程（带当前任务 id，主线程据此路由）
     if (typeof core.setProgress === 'function') {
       core.setProgress(({ ratio }) => {
         // ratio 可能是 Infinity/NaN（ffmpeg 启动初期），过滤掉
         if (Number.isFinite(ratio)) {
-          postMessage({ type: 'progress', progress: Math.max(0, Math.min(1, ratio)) });
+          postMessage({
+            id: currentTaskId,
+            type: 'progress',
+            progress: Math.max(0, Math.min(1, ratio)),
+          });
         }
       });
     }
     return core;
   })();
+  // 任何阶段失败（importScripts / factory / wasm 下载）都重置单例，
+  // 否则 corePromise 永远保持 rejected，后续转码全部直接失败
+  corePromise.catch(() => { corePromise = null; });
   return corePromise;
 }
 
@@ -81,6 +86,7 @@ self.onmessage = async (e) => {
 
   try {
     const core = await loadCore(coreURL);
+    currentTaskId = id;
 
     // 写入虚拟 FS（每次用唯一名，避免并发或残留冲突）
     const inName = 'in_' + id;
@@ -129,7 +135,13 @@ self.onmessage = async (e) => {
     try { core.FS.unlink(inName); } catch (_) {}
     try { core.FS.unlink(outName); } catch (_) {}
 
-    postMessage({ id, type: 'done', out });
+    // 优先 transfer 零拷贝送回主线程；仅当 out 不是独立 buffer
+    // （某些 Emscripten 版本 readFile 可能返回子视图）时退化为拷贝，
+    // 避免把整个底层 buffer（含无关数据）一起 detach 走
+    const outBuf = (out.byteOffset === 0 && out.buffer.byteLength === out.byteLength)
+      ? out.buffer
+      : out.slice().buffer;
+    postMessage({ id, type: 'done', out: new Uint8Array(outBuf) }, [outBuf]);
   } catch (err) {
     // 加载阶段失败等
     postMessage({ id, type: 'error', message: String(err && err.message || err) });
