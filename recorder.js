@@ -134,8 +134,15 @@ async function startRecording() {
   recorder.onstop = () => onStopped();
 
   // Chrome 原生「停止共享」条 → 干净收尾
-  stream.getVideoTracks()[0]?.addEventListener('ended', () => {
-    if (recorder?.state !== 'inactive') stopRecording();
+  // 监听录制流的所有轨道：
+  //   - 普通桌面模式：视频轨 ended 即可
+  //   - 兼容模式：视频来自 tabCapture、音频来自 getDisplayMedia，
+  //     用户点「停止共享」只会让 getDisplayMedia 的音频轨 ended，
+  //     必须监听音频轨才能捕获，否则录制继续但从此刻起没声音
+  recStream.getTracks().forEach(t => {
+    t.addEventListener('ended', () => {
+      if (recorder?.state !== 'inactive') stopRecording();
+    });
   });
 
   recorder.start(1000);
