@@ -36,6 +36,10 @@
 (function (G) {
   'use strict';
 
+  // 本文件跑在 offscreen document / recorder.html，二者都是 chrome-extension:// 页面，
+  // 所以 worker 继承扩展源、worker 内 importScripts 内核也是同源加载 —— 无需
+  // web_accessible_resources（WAR 只用于把资源暴露给扩展源之外的上下文，
+  // 加上反而让任意网页可探测本扩展是否安装）。
   const CORE_URL = chrome.runtime.getURL('lib/ffmpeg/ffmpeg-core.js');
   const WORKER_URL = chrome.runtime.getURL('transcoder-worker.js');
 

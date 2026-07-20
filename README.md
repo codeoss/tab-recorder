@@ -97,7 +97,7 @@ npm i @ffmpeg/core@0.12.10
 
 > 只需要这 2 个文件。`ffmpeg-core.worker.js` 不存在于 0.12 单线程版（它是 `@ffmpeg/core-mt` 多线程版的文件）——ffmpeg 现在跑在扩展自带的 `transcoder-worker.js` 里（独立的 Web Worker），转码期间 UI 完全不卡。
 
-> manifest.json 已经配好了 MV3 必需的 `wasm-unsafe-eval` CSP 和 `web_accessible_resources`，无需手动改。
+> manifest.json 已经配好了 MV3 跑 wasm 必需的 `wasm-unsafe-eval` CSP，无需手动改。不需要 `web_accessible_resources`：worker 与 ffmpeg 内核都由扩展页面同源加载，WAR 只会把资源暴露给任意网页、让扩展可被指纹识别。
 
 > 即便不放入内核、也不选 MP4，WebM 输出与全部录制功能均正常工作。
 

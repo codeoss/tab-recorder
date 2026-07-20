@@ -27,15 +27,5 @@
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
-  },
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "lib/ffmpeg/ffmpeg-core.js",
-        "lib/ffmpeg/ffmpeg-core.wasm",
-        "transcoder-worker.js"
-      ],
-      "matches": ["<all_urls>"]
-    }
-  ]
+  }
 }
