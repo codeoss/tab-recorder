@@ -24,6 +24,7 @@
  * 依赖（调用方 HTML 里要先加载）：
  *   fix-webm.js → fixWebMBlob
  *   transcoder.js → webmToMp4（webm 转 mp4 时用）/ mp4Faststart（原生 mp4 修 faststart 时用）
+ *                  （两者内部都跑在 Web Worker，转码期间主线程不阻塞）
  */
 
 (function (G) {
@@ -169,7 +170,7 @@
         // 写在末尾，导致播放器必须下载完整文件才能 seek（进度条拖不动）。
         // 用 ffmpeg -c copy -movflags +faststart 把 moov 搬到开头（流复制，
         // 不重编码，比转码快一个数量级）。失败则回退到原始 blob（能播不能拖）。
-        // TODO(额外C): ffmpeg.wasm 走 callMain 同步阻塞主线程，后续切 worker 版。
+        // mp4Faststart 内部跑在 Web Worker（见 transcoder.js），不阻塞主线程。
         try {
           finalBlob = await mp4Faststart(blob);
         } catch (e) {
@@ -181,9 +182,8 @@
         finalBlob = blob;
 
         // 用户要 MP4 但原生不支持 → ffmpeg.wasm 转码
-        // TODO(额外C): 当前 ffmpeg.wasm 走 callMain 同步阻塞主线程，转码期间
-        //   引擎无法响应任何消息。后续应切到 @ffmpeg/ffmpeg 的 worker 版。
-        //   现阶段靠 onEvent('processing') 让 UI 提示「转码中请勿关闭」。
+        // webmToMp4 内部跑在 Web Worker（见 transcoder.js），转码期间引擎
+        // 仍可响应 OFF_STOP 等消息；onEvent('processing') 让 UI 提示「转码中」。
         if (outputFormat === 'mp4') {
           try {
             finalBlob = await webmToMp4(blob);
