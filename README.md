@@ -18,7 +18,7 @@
 | ⏱️ 倒计时 | 录制前可选 3/5/10 秒倒计时 |
 | ⏸️ 暂停 / 恢复 / 丢弃 | 录制中可暂停、恢复或丢弃 |
 | 🎬 WebM 输出 | 原生 `MediaRecorder`，并修复 EBML 索引使其可拖动进度条 |
-| 📦 可选 MP4 转码 | 勾选后用 ffmpeg.wasm 转 H.264/AAC MP4（需自行放入内核，见下） |
+| 📦 可选 MP4 输出 | 新版 Chrome 原生录 H.264/AAC；老版本用 ffmpeg.wasm 转码（内核需自行放入，见下） |
 | ☁️ 云桌面兼容模式 | RDP/云桌面下 tabCapture 音频劫持失效时的兜底方案 |
 | 📜 历史记录 | 最近 5 次录制展示在弹窗 |
 
@@ -74,9 +74,17 @@ tab-recorder-ext/
 
 ---
 
-## 📦 可选：启用 MP4 转码
+## 📦 可选：启用 MP4 输出
 
-MP4 转码依赖 ffmpeg.wasm，体积较大（约 30MB），未随扩展打包。启用步骤：
+「输出格式」选 **MP4** 时，按环境自动走三档之一：
+
+| 环境 | 行为 | 产物 |
+|---|---|---|
+| 新版 Chrome（原生支持 MP4 录制）＋ 已放入内核 | 原生录 H.264/AAC，结束后用 ffmpeg 做 **faststart**（流复制搬 moov，不重编码，秒级） | 可拖动的 `.mp4` |
+| 新版 Chrome 但未放入内核 | 原生录制，但无法修 moov 位置 | 能播放、**进度条拖不动**的 `.mp4` |
+| 老版本 Chrome（无原生 MP4） | 先录 WebM，结束后用 ffmpeg 转码（慢，长视频可达数十分钟） | 可拖动的 `.mp4`；无内核或转码失败回退 `.webm` |
+
+可见无论哪条路径，想要「可用的 MP4」都离不开 ffmpeg 内核（faststart 或转码），建议按下文放入。内核体积较大（约 30MB），故未随扩展打包：
 
 ```bash
 npm i @ffmpeg/core@0.12.10
@@ -87,11 +95,11 @@ npm i @ffmpeg/core@0.12.10
 
 复制到 `lib/ffmpeg/`，然后在弹窗「输出格式」选择 **MP4**，重新加载扩展即可。
 
-> 只需要这 2 个文件。`ffmpeg-core.worker.js` 不再需要——ffmpeg 现在跑在扩展自带的 `transcoder-worker.js` 里（独立的 Web Worker），转码期间 UI 完全不卡。
+> 只需要这 2 个文件。`ffmpeg-core.worker.js` 不存在于 0.12 单线程版（它是 `@ffmpeg/core-mt` 多线程版的文件）——ffmpeg 现在跑在扩展自带的 `transcoder-worker.js` 里（独立的 Web Worker），转码期间 UI 完全不卡。
 
 > manifest.json 已经配好了 MV3 必需的 `wasm-unsafe-eval` CSP 和 `web_accessible_resources`，无需手动改。
 
-> 即便不启用 MP4，WebM 输出与全部录制功能均正常工作；转码失败会自动回退为 WebM。
+> 即便不放入内核、也不选 MP4，WebM 输出与全部录制功能均正常工作。
 
 ---
 

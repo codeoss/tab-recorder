@@ -18,5 +18,9 @@ lib/ffmpeg/
 manifest.json 已配好 wasm-unsafe-eval CSP 和 web_accessible_resources，
 无需手动调整。
 
+补充：新版 Chrome 可原生录 MP4，本目录内核用于结束后 faststart
+（搬 moov 让进度条可拖）；老版本 Chrome 则用于整段转码。
+两条路径都需要内核才能得到「可用的 MP4」。
+
 来源：
   https://github.com/ffmpegwasm/ffmpeg.wasm （@ffmpeg/core 是 wasm 编译产物）
