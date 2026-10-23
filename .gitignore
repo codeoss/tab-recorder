@@ -4,10 +4,10 @@
 
 # ===== ffmpeg.wasm 内核（按 README 手动放入，不进版本库）=====
 # 体积约 30MB，版权/体积原因不随扩展打包；保留 README.txt
-#lib/ffmpeg/ffmpeg-core.js
-#lib/ffmpeg/ffmpeg-core.wasm
-#lib/ffmpeg/ffmpeg-core.worker.js
-#lib/ffmpeg/*.wasm
+lib/ffmpeg/ffmpeg-core.js
+lib/ffmpeg/ffmpeg-core.wasm
+lib/ffmpeg/ffmpeg-core.worker.js
+lib/ffmpeg/*.wasm
 
 # ===== Node.js / npm（启用 MP4 转码时才会用到）=====
 node_modules/
