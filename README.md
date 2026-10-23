@@ -84,16 +84,26 @@ tab-recorder-ext/
 | 新版 Chrome 但未放入内核 | 原生录制，但无法修 moov 位置 | 能播放、**进度条拖不动**的 `.mp4` |
 | 老版本 Chrome（无原生 MP4） | 先录 WebM，结束后用 ffmpeg 转码（慢，长视频可达数十分钟） | 可拖动的 `.mp4`；无内核或转码失败回退 `.webm` |
 
-可见无论哪条路径，想要「可用的 MP4」都离不开 ffmpeg 内核（faststart 或转码），建议按下文放入。内核体积较大（约 30MB），故未随扩展打包：
+可见无论哪条路径，想要「可用的 MP4」都离不开 ffmpeg 内核（faststart 或转码），建议按下文放入。内核体积较大（约 30MB）且为 GPL-2.0-or-later 许可（内含 libx264），故未随扩展打包。两种放入方式任选其一：
+
+**方式 A：npm 下载**
 
 ```bash
 npm i @ffmpeg/core@0.12.10
 ```
-把 `node_modules/@ffmpeg/core/dist/` 下的：
+把 `node_modules/@ffmpeg/core/dist/umd/` 下的（注意是 `umd` 子目录——扩展 worker 用 `importScripts` 加载，需要 UMD 构建）：
 - `ffmpeg-core.js`
 - `ffmpeg-core.wasm`
 
-复制到 `lib/ffmpeg/`，然后在弹窗「输出格式」选择 **MP4**，重新加载扩展即可。
+复制到 `lib/ffmpeg/`（保持原文件名），然后在弹窗「输出格式」选择 **MP4**，重新加载扩展即可。
+
+**方式 B：直接下载（不装 npm）**
+
+从 CDN 下载这两个文件放入 `lib/ffmpeg/`，与方式 A 完全等价：
+- https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js
+- https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.wasm
+
+> 详见 `lib/ffmpeg/README.txt`（jsdelivr 镜像、`curl` 一条龙、许可证与常见问题）。
 
 > 只需要这 2 个文件。`ffmpeg-core.worker.js` 不存在于 0.12 单线程版（它是 `@ffmpeg/core-mt` 多线程版的文件）——ffmpeg 现在跑在扩展自带的 `transcoder-worker.js` 里（独立的 Web Worker），转码期间 UI 完全不卡。
 
