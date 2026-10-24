@@ -61,7 +61,8 @@ recorder.html / recorder.js     # 窗口/屏幕/兼容模式录制窗口。URL h
 core-recorder.js      # 公共录制引擎 createRecorderEngine({ getStream, onEvent, releaseExtra })。
                       # MediaRecorder 生命周期、分片累积（60s compact 一次）、定时停止、
                       # onStopped 异步链：fix-webm → 可选 MP4 处理 → 触发下载 → 上报历史
-fix-webm.js           # 手写 EBML 解析器：重建 Cues 索引 + 修补 Duration，纯 JS 无依赖。
+fix-webm.js           # 手写 EBML 解析器：重建 Cues 索引 + 修补 Duration（Chrome 未写
+                      # Duration 时向 Info 段插入新元素，并同步后移 Cues 的簇偏移），纯 JS 无依赖。
                       # 注释为英文（移植自 ScreenCap Pro v1.4.1），修改时保持英文注释风格
 transcoder.js         # ffmpeg 主线程入口（懒加载）：webmToMp4(blob) / mp4Faststart(blob)，
                       # 内部把任务 postMessage 给 worker；超时随输入大小缩放，超时 terminate 重建

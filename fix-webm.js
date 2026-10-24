@@ -9,7 +9,8 @@
  *   1) Scanning all Cluster elements to read their Timecodes + byte offsets
  *   2) Building a proper Cues element (seek index)
  *   3) Appending Cues at the end of the file
- *   4) Patching Duration in the Info element
+ *   4) Patching Duration in the Info element — or INSERTING one when Chrome
+ *      never wrote it (Info grows; cluster offsets in Cues shift accordingly)
  *
  * After fixing, the file is fully seekable in Chrome, Firefox, VLC, etc.
  */
@@ -97,6 +98,18 @@
       v = Math.floor(v / 256);
     }
     bytes[0] = v | (1 << (8 - len));  // set VINT marker
+    return bytes;
+  }
+
+  /** Encode a VINT size value at an exact byte width (for in-place rewrites). */
+  function encodeVintSizeFixed(value, width) {
+    const bytes = new Uint8Array(width);
+    let v = value;
+    for (let i = width - 1; i >= 1; i--) {
+      bytes[i] = v & 0xFF;
+      v = Math.floor(v / 256);
+    }
+    bytes[0] = (v & ((1 << (8 - width)) - 1)) | (1 << (8 - width));
     return bytes;
   }
 
@@ -199,6 +212,10 @@
 
     /* ── Step 3: Scan Segment children ── */
     let infoOff = -1, infoLen = 0;    // Info element (header + data)
+    let infoSzOff = 0, infoSzLen = 0; // where Info's size VINT is, and its width
+    let infoDataStart = 0;            // Info data begin
+    let infoDataEnd = -1;             // Info data end (-1 if unknown size)
+    let infoDefinite = false;         // Info written with a definite size
     let durationDataOff = -1;         // where Duration float is
     let durationDataLen = 0;
     let timecodeScale = 1000000;
@@ -216,6 +233,11 @@
       if (elId.id === ID.INFO) {
         infoOff = cur;
         infoLen = elId.len + elSz.len + (elSz.unknown ? 0 : elSz.val);
+        infoSzOff = szOff;
+        infoSzLen = elSz.len;
+        infoDefinite = !elSz.unknown;
+        infoDataStart = dataOff;
+        infoDataEnd = infoDefinite ? Math.min(dataOff + elSz.val, total) : -1;
 
         // Parse Info children
         const infoEnd = elSz.unknown ? segEnd : Math.min(dataOff + elSz.val, total);
@@ -292,31 +314,67 @@
 
     if (clusters.length === 0) return buf;
 
-    /* ── Step 4: Build Cues element ── */
+    /* ── Step 4: Duration — patch in place, or INSERT into Info ──
+
+       Chrome's MediaRecorder sometimes writes no Duration element at all.
+       In that case we append an 8-byte Duration at the end of Info's data
+       and grow Info's size VINT (rewritten in place when its capacity
+       suffices, widened by one byte otherwise). The insertion shifts every
+       byte after Info right by insertLen, so each Cluster's Segment-relative
+       offset recorded for Cues must shift right by the same amount. ── */
+    const durVal = (durationMs * 1000000) / timecodeScale;
+    let insertLen = 0;
+    let newInfoVint = null;
+    let durEl = null;
+
+    if (durationDataOff < 0 && infoDefinite && infoDataEnd > 0) {
+      const dv8 = new Uint8Array(8);
+      new DataView(dv8.buffer).setFloat64(0, durVal);
+      durEl = concat(new Uint8Array(ID_BYTES.DURATION), new Uint8Array([0x88]), dv8);
+
+      const newInfoSize = (infoDataEnd - infoDataStart) + durEl.byteLength;
+      // An n-byte VINT carries 7n payload bits; all-ones is "unknown size".
+      const capacity = Math.pow(2, 7 * infoSzLen) - 2;
+      const newVintLen = newInfoSize <= capacity ? infoSzLen : infoSzLen + 1;
+      newInfoVint = encodeVintSizeFixed(newInfoSize, newVintLen);
+      insertLen = durEl.byteLength + (newVintLen - infoSzLen);
+
+      for (const c of clusters) { c.relativeOff += insertLen; c.absoluteOff += insertLen; }
+    }
+
+    /* ── Step 5: Build Cues element (offsets must be final by now) ── */
     const cuesData = buildCues(clusters);
 
-    /* ── Step 5: Build new file = original + Cues appended ── */
-    const origBytes = new Uint8Array(buf);
-    const newBuf = new Uint8Array(total + cuesData.byteLength);
-    newBuf.set(origBytes, 0);
-    newBuf.set(cuesData, total);
+    /* ── Step 6: Build new file ── */
+    let newBuf;
+    if (insertLen > 0) {
+      // [.. Info size VINT) + new VINT + Info data + Duration + rest + Cues
+      newBuf = concat(
+        new Uint8Array(buf, 0, infoSzOff),
+        newInfoVint,
+        new Uint8Array(buf, infoSzOff + infoSzLen, infoDataEnd - (infoSzOff + infoSzLen)),
+        durEl,
+        new Uint8Array(buf, infoDataEnd, total - infoDataEnd),
+        cuesData,
+      );
+    } else {
+      const origBytes = new Uint8Array(buf);
+      newBuf = new Uint8Array(total + cuesData.byteLength);
+      newBuf.set(origBytes, 0);
+      newBuf.set(cuesData, total);
+    }
 
-    /* ── Step 6: Fix Duration ── */
+    /* ── Step 7: Patch Duration in place when Chrome wrote one ── */
     const newDv = new DataView(newBuf.buffer);
-    const durVal = (durationMs * 1000000) / timecodeScale;
-
     if (durationDataOff >= 0 && durationDataLen === 8) {
       newDv.setFloat64(durationDataOff, durVal);
     } else if (durationDataOff >= 0 && durationDataLen === 4) {
       newDv.setFloat32(durationDataOff, durVal);
     }
-    // If Duration element doesn't exist, we skip insertion for simplicity —
-    // Cues alone is enough for seeking, and most players derive duration
-    // from the last Cluster's timecode.
 
-    /* ── Step 7: Update Segment size if it was fixed (not unknown) ── */
+    /* ── Step 8: Update Segment size if it was fixed (not unknown) ── */
     if (!segSz.unknown) {
-      const newSegSize = segSz.val + cuesData.byteLength;
+      const newSegSize = segSz.val + cuesData.byteLength + insertLen;
       // An n-byte VINT size field carries 7n payload bits, and all-ones is
       // reserved for "unknown size". If the new size exceeds the field's
       // capacity, writing it in place would silently truncate and corrupt

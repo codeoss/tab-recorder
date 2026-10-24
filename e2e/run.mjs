@@ -132,6 +132,7 @@ let failed = 0;
 function ok(name, cond, extra = '') {
   console.log(`${cond ? '  ✅' : '  ❌'} ${name}${extra ? ' — ' + extra : ''}`);
   if (!cond) failed++;
+  return cond;   // 调用方用 if(!ok(...))return 短路，必须返回 cond
 }
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 
@@ -193,9 +194,8 @@ function checkWebM(file, { minMs = 0, maxMs = Infinity } = {}) {
     }
   }
   if (i < 0) {
-    // Chrome muxer 是否写出 Duration 字段不稳定（实测同环境时有时无）；
-    // fix-webm 只「修补」已有 Duration、不「插入」，此时 Duration 修复无覆盖
-    console.log('  ⚠️ 无 Duration 元素（Chrome 未写出；fix-webm 目前不插入——已知产品缺口）');
+    // fix-webm 现在会在 Info 段插入 Duration；缺失即真回归
+    ok('含 Duration 元素（缺失时 fix-webm 应插入）', false);
     return;
   }
   const at = i;
