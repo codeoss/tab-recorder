@@ -80,8 +80,9 @@
     .hidden{display:none!important}
     .dis{opacity:.4;pointer-events:none}
 
-    .cdov{position:fixed;inset:0;background:rgba(15,15,19,.92);display:flex;align-items:center;justify-content:center;z-index:999}
+    .cdov{position:fixed;inset:0;background:rgba(15,15,19,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:999;cursor:pointer}
     .cdn{font-size:64px;font-weight:700;color:var(--ac)}
+    .cdh{margin-top:10px;font-size:12px;color:var(--t3)}
 
     .hs{margin-top:12px}
     .hi{padding:8px 10px;background:var(--bg2);border-radius:7px;margin-bottom:4px}
@@ -194,7 +195,7 @@
   </div>
 
   <div class="ft">Tab 录制大师 · 完全离线 · 无限时长 · 数据不上传</div>
-  <div class="cdov hidden" id="cdOvl"><div class="cdn" id="cdNum">3</div></div>
+  <div class="cdov hidden" id="cdOvl"><div class="cdn" id="cdNum">3</div><div class="cdh">点击任意处取消</div></div>
 
   <script src="popup.js"></script>
 </body>

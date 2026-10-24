@@ -105,9 +105,11 @@ self.onmessage = async (e) => {
         : core.exec(fullArgs);
       if (typeof code === 'number') exitCode = code;
     } catch (err) {
-      // exit(0) 抛异常是 Emscripten 的正常行为；非 0 退出才算真错
+      // Emscripten 正常退出会抛 ExitStatus 异常（status === 0），当成功；
+      // 消息格式随 Emscripten 版本变化，仅作兜底；非 0 退出才算真错
       const msg = String(err && err.message || err);
-      if (!/exit\(0\)|PROXY_TO_PTHREAD/.test(msg)) {
+      const okExit = (err && err.status === 0) || /exit\(0\)|PROXY_TO_PTHREAD/.test(msg);
+      if (!okExit) {
         // 真错：清理后上报
         try { core.FS.unlink(inName); } catch (_) {}
         try { core.FS.unlink(outName); } catch (_) {}

@@ -53,16 +53,21 @@
     let tickInterval = null;
     let paused_ = false;        // 是否处于暂停态（内部状态，外部用 isPaused() 查询）
     let isProcessing = false;   // onStopped 异步链进行中：关窗会丢视频
+    let discarded = false;      // 处理中被丢弃：onStopped 链跑完后不下载、不写历史
     let limitMs = 0;
     let outputFormat = 'webm';
 
     /* ── 开始录制 ────────────────────────────────────── */
 
     async function start(opts) {
+      // 重入守卫：上一段还在录制/保存时拒绝。旧 engine 的 MediaRecorder 与
+      // 媒体轨一旦失去引用就再无法停止，会变成幽灵录制
+      if (isRecording() || isProcessing) return false;
       opts = opts || {};
       limitMs = (opts.timeLimit || 0) * 1000;
       outputFormat = opts.outputFormat || 'webm';
       isProcessing = false;
+      discarded = false;
 
       const recStream = await getStream(opts);
       if (!recStream) return false;   // 取流失败，调用方已在 onEvent('error') 上报
@@ -105,6 +110,9 @@
     /* ── 停止 / 暂停 / 恢复 / 丢弃 ──────────────────── */
 
     function stop() {
+      // 暂停态直接停止：先把这段暂停并入 pausedMs，否则 elapsed() 会把
+      // 暂停时长算进结果，fixWebM 补出的 Duration 比真实内容长
+      if (paused_ && pauseTs) { pausedMs += Date.now() - pauseTs; paused_ = false; }
       if (stopTimer)  { clearTimeout(stopTimer);  stopTimer = null; }
       if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
       if (recorder && recorder.state !== 'inactive') recorder.stop();
@@ -131,6 +139,9 @@
     }
 
     function discard() {
+      // 标记丢弃：若 onStopped 异步链（fixWebM/转码）正在进行，
+      // 让它跑完后静默收尾——不下载、不写历史
+      discarded = true;
       chunks = [];
       if (stopTimer)  { clearTimeout(stopTimer);  stopTimer = null; }
       if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
@@ -192,6 +203,13 @@
             console.warn('MP4 转码失败，回退 WebM：', e);
           }
         }
+      }
+
+      // 处理期间用户点了「丢弃」：静默收尾，不下载、不写历史
+      if (discarded) {
+        isProcessing = false;
+        emit('processing', { active: false });
+        return;
       }
 
       dl(finalBlob, filename);
