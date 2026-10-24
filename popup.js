@@ -27,6 +27,7 @@ let state = 'idle';
 let tick = null;
 let poll = null;
 let bgStart = 0, bgPaused = 0, bgLimit = 0;
+let wasProcessing = false;   // 上次轮询时引擎是否在保存/转码（用于完成时刻刷历史）
 
 /* ── 初始化 ──────────────────────────────────────────── */
 
@@ -40,6 +41,8 @@ function events() {
   el.rec.addEventListener('click', toggle);
   el.pause.addEventListener('click', togglePause);
   el.discard.addEventListener('click', discard);
+  // 倒计时覆盖层全屏盖住弹窗，本身即取消按钮（大点击目标）
+  el.cdOvl.addEventListener('click', () => { if (state === 'countdown') stop(); });
 
   document.querySelectorAll('.sb').forEach(b => b.addEventListener('click', () => {
     if (state !== 'idle') return;
@@ -175,18 +178,20 @@ async function start() {
     }
   } catch (e) {
     el.cdOvl.classList.add('hidden');
-    status('rdy', `错误: ${e.message}`);
-    state = 'idle'; ui();
+    state = 'idle'; ui();   // ui() 会重置状态文案，先调用
+    status('rdy', e.message === '已取消' ? '已取消' : `错误: ${e.message}`);
   }
   el.rec.style.pointerEvents = 'auto';
 }
 
 async function stop() {
+  const cancelling = state === 'countdown';
   try { await send('STOP_RECORDING'); } catch (_) {}
   state = 'idle'; stopTick(); ui();
-  status('rdy', '录制完成');
+  el.cdOvl.classList.add('hidden');   // 取消倒计时时必须收掉覆盖层，否则会停在最后的秒数
+  status('rdy', cancelling ? '已取消' : '录制完成');
   hideLimit();
-  setTimeout(loadHistory, 600);
+  if (!cancelling) setTimeout(loadHistory, 600);
 }
 
 async function togglePause() {
@@ -242,7 +247,12 @@ async function pollState() {
     if (!bg) return;
     if (bg.fileSize > 0 && state !== 'idle') el.size.textContent = fmtMB(bg.fileSize);
 
-    if (bg.status === 'countdown' && bg.countdownRemaining > 0) showCountdown(bg.countdownRemaining);
+    // 倒计时：同步本地状态机 + 覆盖层数字；此阶段按钮可用作取消
+    if (bg.status === 'countdown') {
+      if (state !== 'countdown') { state = 'countdown'; ui(); }
+      el.rec.style.pointerEvents = 'auto';   // start() 里禁用过，倒计时期间恢复以允许取消
+      if (bg.countdownRemaining > 0) showCountdown(bg.countdownRemaining);
+    }
 
     // 自动停止检测
     if (bg.status === 'idle' && state !== 'idle') {
@@ -253,12 +263,32 @@ async function pollState() {
       setTimeout(loadHistory, 600);
     }
 
-    // 倒计时后开始录制
-    if (bg.status === 'recording' && state === 'idle') {
+    // 倒计时后开始录制（本地状态可能是 idle 或 countdown——重开 popup 恢复时）
+    if (bg.status === 'recording' && (state === 'idle' || state === 'countdown')) {
       el.cdOvl.classList.add('hidden');
       state = 'recording';
       bgStart = bg.startTime; bgPaused = bg.pausedTime; bgLimit = bg.timeLimit;
       ui(); startTick(); showLimit();
+    }
+
+    // 录制中重同步：desktop 模式 RECORDER_STARTED 会修正 bg.startTime
+    // （用户选源耗时原本被计入），本地起点偏差大时跟随修正
+    if (bg.status === 'recording' && state === 'recording' &&
+        bg.startTime && Math.abs(bg.startTime - bgStart) > 2000) {
+      bgStart = bg.startTime; bgPaused = bg.pausedTime;
+    }
+
+    // 引擎保存/转码中（tab 模式 STOP 后 bg 即 idle，但文件还在处理）：
+    // 显示「处理中」；处理结束后再提示完成并刷新历史
+    if (state === 'idle') {
+      if (bg.processing) {
+        status('rdy', '正在保存/转码…');
+        wasProcessing = true;
+      } else if (wasProcessing) {
+        wasProcessing = false;
+        status('rdy', '录制完成');
+        setTimeout(loadHistory, 300);
+      }
     }
   } catch (_) {}
 }
@@ -283,6 +313,12 @@ function ui() {
       el.ctrls.classList.remove('hidden'); el.pause.innerHTML = '▶ 继续';
       el.timer.classList.add('on');
       status('pau', '已暂停');
+      break;
+    case 'countdown':
+      // 倒计时阶段：按钮可用作取消（stop 路径会中止 offscreen 的倒计时）
+      el.rec.className = 'rb pau'; el.label.textContent = '点击取消倒计时';
+      el.ctrls.classList.add('hidden'); el.timer.classList.remove('on');
+      status('rdy', '倒计时中…');
       break;
   }
   el.sp.classList.toggle('dis', state !== 'idle');

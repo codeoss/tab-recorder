@@ -18,6 +18,7 @@
 
 let audioCtx = null;
 let engine = null;
+let startGen = 0;   // 启动代次：每次新启动或取消都递增，旧代次的 pending 启动自动失效
 
 /* ── 消息处理：把 background 的 OFF_* 转成 engine 方法 ── */
 
@@ -25,10 +26,11 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   if (msg.target !== 'offscreen') return false;
   const h = {
     OFF_START:   () => doStart(msg),
-    OFF_STOP:    () => { engine && engine.stop();    return { ok: 1 }; },
+    // 停止/丢弃一律递增代次：任何还在倒计时/取 streamId 途中的旧启动都会失效
+    OFF_STOP:    () => { startGen++; if (engine) engine.stop();    return { ok: 1 }; },
     OFF_PAUSE:   () => { engine && engine.pause();   return { ok: 1 }; },
     OFF_RESUME:  () => { engine && engine.resume();  return { ok: 1 }; },
-    OFF_DISCARD: () => { engine && engine.discard(); return { ok: 1 }; },
+    OFF_DISCARD: () => { startGen++; if (engine) engine.discard(); return { ok: 1 }; },
   };
   const fn = h[msg.type];
   if (!fn) return false;
@@ -40,10 +42,36 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 /* ── 倒计时 → 创建引擎 → 启动 ─────────────────────── */
 
 async function doStart(opts) {
-  if (opts.countdownSec > 0) await countdown(opts.countdownSec);
+  // 上一段还在录制/保存（onStopped 异步链未完）时拒绝：
+  // 旧链完成时会发 RECORDING_STOPPED，会把新录制的状态掐掉
+  if (engine && engine.isBusy()) return { error: '上一段录制仍在保存中，请稍候' };
+
+  const gen = ++startGen;   // 本代启动的令牌；之后每个 await 检查点都校验
+  if (opts.countdownSec > 0) {
+    const completed = await countdown(opts.countdownSec, gen);
+    if (!completed) return { error: '已取消' };   // 倒计时期间被停止/丢弃/新启动取代
+  }
+
+  // 倒计时结束后才向 background 取 streamId：getMediaStreamId 的 id 应
+  // 尽快消费；提前取好再等倒计时（最长 10s+）可能失效，导致 getUserMedia 挂起
+  const idMsg = await chrome.runtime.sendMessage({ type: 'GET_STREAM_ID', tabId: opts.tabId });
+  if (gen !== startGen) return { error: '已取消' };   // 取 id 往返期间被取消/取代
+  if (!idMsg || !idMsg.streamId) {
+    return { error: (idMsg && idMsg.error) || '获取 streamId 失败' };
+  }
+  opts.streamId = idMsg.streamId;
 
   engine = createRecorderEngine({
-    getStream: (o) => getTabStream(o),
+    // 取流返回后也可能代次已失效（取消/新启动落在 getUserMedia 期间）：
+    // 立即停掉刚到手的流并抛错，绝不让它变成没人持有的孤儿录制
+    getStream: async (o) => {
+      const s = await getTabStream(o);
+      if (gen !== startGen) {
+        s.getTracks().forEach(t => t.stop());
+        throw new Error('已取消');
+      }
+      return s;
+    },
     onEvent: (name, data) => onEvent(name, data),
     releaseExtra: () => releaseAudioCtx(),
   });
@@ -81,11 +109,14 @@ function onEvent(name, data) {
   switch (name) {
     case 'stopped':  notify('RECORDING_STOPPED', { historyEntry: data && data.historyEntry }); break;
     case 'size':     notify('FILE_SIZE_UPDATE',  { size: data.bytes }); break;
-    case 'tick':     /* offscreen 不显示计时，由 popup 自己算 */ break;
     case 'processing':
+      // 上行给 background（state.processing），popup 据此显示「正在保存/转码…」
+      notify('ENGINE_PROCESSING', { active: !!(data && data.active) });
+      break;
+    case 'tick':     /* offscreen 不显示计时，由 popup 自己算 */ break;
     case 'started':
     case 'paused':
-    case 'resumed':
+    case 'resumed':  /* offscreen 无本地 UI，暂停/恢复只能来自 background 下行，无需回传 */
     case 'saved':    /* offscreen 无 UI，无需处理 */ break;
   }
 }
@@ -100,11 +131,13 @@ function releaseAudioCtx() {
   if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
 }
 
-function countdown(sec) {
+// 返回 Promise<boolean>：true = 倒计时跑完；false = 期间被取消/被新启动取代
+function countdown(sec, gen) {
   return new Promise(resolve => {
     let r = sec;
     const tick = () => {
-      if (r <= 0) { resolve(); return; }
+      if (gen !== startGen) { resolve(false); return; }
+      if (r <= 0) { resolve(true); return; }
       notify('COUNTDOWN_TICK', { remaining: r });
       r--; setTimeout(tick, 1000);
     };

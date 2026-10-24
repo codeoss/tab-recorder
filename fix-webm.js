@@ -317,7 +317,16 @@
     /* ── Step 7: Update Segment size if it was fixed (not unknown) ── */
     if (!segSz.unknown) {
       const newSegSize = segSz.val + cuesData.byteLength;
-      writeVintSize(newDv, segSzOff, segSzLen, newSegSize);
+      // An n-byte VINT size field carries 7n payload bits, and all-ones is
+      // reserved for "unknown size". If the new size exceeds the field's
+      // capacity, writing it in place would silently truncate and corrupt
+      // the file — skip the update instead (players can still scan to the
+      // end; Chrome's MediaRecorder output normally uses unknown size and
+      // never reaches this branch).
+      const capacity = Math.pow(2, 7 * segSzLen) - 2;
+      if (newSegSize <= capacity) {
+        writeVintSize(newDv, segSzOff, segSzLen, newSegSize);
+      }
     }
 
     return newBuf.buffer;

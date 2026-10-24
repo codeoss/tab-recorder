@@ -25,6 +25,7 @@ const state = {
   recorderWindowId: 0,
   recorderTabId: 0,        // desktop 模式 recorder 窗口里的 tab id（用于转发指令）
   countdownRemaining: 0,
+  processing: false,       // 引擎正在保存/转码（onStopped 异步链进行中）
 };
 
 /* ═══════════════════════════════════════════════════════
@@ -75,6 +76,24 @@ async function ensureOffscreen() {
 }
 
 /* ═══════════════════════════════════════════════════════
+   录制窗口被关闭 → 归位状态
+
+   必须顶层注册：MV3 只持久化顶层同步注册的 listener。原先在
+   openRecorderWindow 的异步流程里注册，SW 被回收后监听丢失，
+   用户关窗无人清理状态，storage.session 里残留假「录制中」。
+   ═══════════════════════════════════════════════════════ */
+
+chrome.windows.onRemoved.addListener(async windowId => {
+  await stateReady;   // SW 刚被唤醒时 state 可能尚未恢复
+  if (windowId && windowId === state.recorderWindowId && state.recorderWindowId !== 0) {
+    if (state.status !== 'idle') {
+      setState({ status: 'idle', recorderWindowId: 0, recorderTabId: 0 });
+      badge('idle');
+    }
+  }
+});
+
+/* ═══════════════════════════════════════════════════════
    消息路由
    ═══════════════════════════════════════════════════════ */
 
@@ -89,6 +108,11 @@ async function route(msg) {
 
     /* ── 开始录制（来自 popup）────────────────────────── */
     case 'START_RECORDING': {
+      // 重入守卫：录制中/倒计时中/保存中不允许再起一段，否则旧引擎失去引用
+      // 仍在录制（幽灵录制），且旧链的 RECORDING_STOPPED 会把新状态掐掉
+      if (state.status !== 'idle' || state.processing) {
+        return { error: '已有录制进行中或仍在保存，请先停止' };
+      }
       if (msg.source === 'tab' && !msg.compatMode) return await startTabRecording(msg);
       if (msg.source === 'tab' && msg.compatMode)  return await startCompatTabRecording(msg);
       return await startDesktopRecording(msg);
@@ -131,14 +155,48 @@ async function route(msg) {
     case 'GET_STATE':
       return { ...state };
 
+    /* ── offscreen / recorder 窗口取 tab 的 streamId ──────
+       延迟到录制真正开始前才取：getMediaStreamId 的 id 应尽快消费，
+       提前取好再等待倒计时/选屏（可达数分钟）有失效风险 ── */
+    case 'GET_STREAM_ID': {
+      try {
+        return { streamId: await getStreamId(msg.tabId) };
+      } catch (e) {
+        return { error: e.message };
+      }
+    }
+
     /* ── 来自 offscreen / recorder 的事件 ─────────────── */
     case 'RECORDING_STOPPED':
     case 'RECORDER_STOPPED': {
-      setState({ status: 'idle', fileSize: 0, recorderWindowId: 0, recorderTabId: 0 });
+      setState({ status: 'idle', fileSize: 0, recorderWindowId: 0, recorderTabId: 0, processing: false });
       badge('idle');
       if (msg.historyEntry) saveHistory(msg.historyEntry);
       return { ok: 1 };
     }
+
+    /* ── 引擎侧发起的暂停/恢复（recorder 窗口本地按钮）─────
+       幂等：popup 下行路径（PAUSE/RESUME_RECORDING）已记账时不重复 ── */
+    case 'ENGINE_PAUSED': {
+      if (state.status === 'recording') {
+        setState({ status: 'paused', pauseStart: Date.now() });
+        badge('paused');
+      }
+      return { ok: 1 };
+    }
+    case 'ENGINE_RESUMED': {
+      if (state.status === 'paused') {
+        setState({
+          pausedTime: state.pausedTime + (Date.now() - state.pauseStart),
+          status: 'recording',
+        });
+        badge('recording');
+      }
+      return { ok: 1 };
+    }
+    case 'ENGINE_PROCESSING':   // 引擎进入/离开保存链（fixWebM/转码）
+      setState({ processing: !!msg.active });
+      return { ok: 1 };
     case 'RECORDER_STARTED': {
       setState({
         status: 'recording',
@@ -188,15 +246,13 @@ async function startTabRecording(msg) {
   const tab = await activeTab();
   if (!tab) throw new Error('未找到活动标签页');
 
-  // MV3 取 streamId，offscreen 用 chromeMediaSourceId 消费它
-  const streamId = await getStreamId(tab.id);
-
   setState({ status: 'countdown', mode: 'tab' });
 
+  // 不传 streamId：offscreen 倒计时结束后通过 GET_STREAM_ID 现取现用
   const result = await chrome.runtime.sendMessage({
     type: 'OFF_START',
     target: 'offscreen',
-    streamId,
+    tabId: tab.id,
     playTabAudio: msg.playTabAudio,
     width: msg.width,
     height: msg.height,
@@ -207,7 +263,12 @@ async function startTabRecording(msg) {
     outputFormat: msg.outputFormat || 'webm',
   });
 
-  if (result?.error) throw new Error(result.error);
+  if (result?.error) {
+    // OFF_START 失败（取流被拒、倒计时被取消等）：回滚状态，否则会永远卡在 countdown
+    setState({ status: 'idle', countdownRemaining: 0 });
+    badge('idle');
+    throw new Error(result.error);
+  }
 
   setState({
     status: 'recording',
@@ -229,7 +290,6 @@ async function startTabRecording(msg) {
 async function startCompatTabRecording(msg) {
   const tab = await activeTab();
   if (!tab) throw new Error('未找到活动标签页');
-  const streamId = await getStreamId(tab.id);
 
   const params = new URLSearchParams({
     source: 'tab-compat',
@@ -239,7 +299,7 @@ async function startCompatTabRecording(msg) {
     fps: String(msg.fps || 30),
     quality: String(msg.quality || 8000000),
     timeLimit: String(msg.timeLimit || 0),
-    tabStreamId: streamId,
+    tabId: String(tab.id),   // streamId 由 recorder 窗口选屏结束后经 GET_STREAM_ID 现取
     outputFormat: msg.outputFormat || 'webm',
   });
   return await openRecorderWindow(params, msg.timeLimit || 0);
@@ -286,17 +346,6 @@ async function openRecorderWindow(params, timeLimit) {
     timeLimit: timeLimit || 0,
   });
   badge('recording');
-
-  // 用户关闭录制窗口 → 归位状态
-  chrome.windows.onRemoved.addListener(function listener(windowId) {
-    if (windowId === win.id) {
-      chrome.windows.onRemoved.removeListener(listener);
-      if (state.status !== 'idle') {
-        setState({ status: 'idle', recorderWindowId: 0, recorderTabId: 0 });
-        badge('idle');
-      }
-    }
-  });
 
   return { ok: 1 };
 }

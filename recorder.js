@@ -49,14 +49,14 @@ function getConfig() {
     fps:         parseInt(p.get('fps'))    || 30,
     quality:     parseInt(p.get('quality'))|| 8000000,
     timeLimit:   parseInt(p.get('timeLimit')) || 0,
-    tabStreamId: p.get('tabStreamId') || '',
+    tabId:       parseInt(p.get('tabId'))  || 0,
     outputFormat:p.get('outputFormat') || 'webm',
   };
 }
 
 const config = getConfig();
 limitMs = config.timeLimit * 1000;
-const isCompatMode = config.source === 'tab-compat' && config.tabStreamId;
+const isCompatMode = config.source === 'tab-compat' && config.tabId;
 
 if (isCompatMode) {
   document.getElementById('title').textContent = '☁️ 云桌面兼容录制';
@@ -108,6 +108,9 @@ window.addEventListener('beforeunload', e => {
 
 async function startRecording() {
   errMsg.classList.add('hidden');
+  // 防重入：engine.start() 里要等用户在选屏器里操作，期间按钮必须禁用，
+  // 否则重复点击会创建两个 engine，第一路的流失去引用泄漏
+  startBtn.disabled = true;
 
   engine = createRecorderEngine({
     getStream: () => getCaptureStream(),
@@ -129,6 +132,8 @@ async function startRecording() {
       limitTxt.classList.remove('hidden');
       pWrap.classList.remove('hidden');
     }
+  } else {
+    startBtn.disabled = false;   // 失败（取消/取流失败）允许重试
   }
 }
 
@@ -164,12 +169,27 @@ async function startCompatCapture() {
   }
 
   // 2. tabCapture 仅取视频（不劫持音频 → 标签页仍可发声）
+  //    streamId 此刻才取：getMediaStreamId 的 id 应尽快消费，
+  //    提前取好再等用户选屏（可达数分钟）可能失效
+  let tabStreamId;
+  try {
+    const idMsg = await chrome.runtime.sendMessage({ type: 'GET_STREAM_ID', tabId: config.tabId });
+    tabStreamId = idMsg && idMsg.streamId;
+    if (!tabStreamId) throw new Error((idMsg && idMsg.error) || '未返回 streamId');
+  } catch (e) {
+    showError('获取标签页 streamId 失败: ' + e.message);
+    sysAudioTracks.forEach(t => t.stop());
+    screenAudioStream = null;
+    notifyBg('RECORDER_STOPPED', { historyEntry: null });
+    return null;
+  }
+
   let tabVideoStream;
   try {
     tabVideoStream = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: { mandatory: {
-        chromeMediaSource: 'tab', chromeMediaSourceId: config.tabStreamId,
+        chromeMediaSource: 'tab', chromeMediaSourceId: tabStreamId,
         maxWidth: config.width, maxHeight: config.height, maxFrameRate: config.fps,
       } },
     });
@@ -222,12 +242,14 @@ function onEvent(name, data) {
       setStatus('pau', '已暂停');
       pauseBtn.textContent = '▶ 继续';
       dot.classList.add('paused');
+      notifyBg('ENGINE_PAUSED', {});   // 上行通知 background（窗口本地按钮发起的暂停）
       break;
 
     case 'resumed':
       setStatus('rec', '录制中');
       pauseBtn.textContent = '⏸ 暂停';
       dot.classList.remove('paused');
+      notifyBg('ENGINE_RESUMED', {});  // 上行通知 background
       break;
 
     case 'tick':
@@ -241,11 +263,12 @@ function onEvent(name, data) {
       break;
 
     case 'processing':
-      // 额外 C：转码期间提示用户不要关窗
+      // 转码/保存期间提示用户不要关窗，并上行给 background（popup 也会显示）
       if (data.active) {
         stxt.textContent = '处理中...（转码中请勿关闭窗口）';
         dot.style.animation = 'none';
       }
+      notifyBg('ENGINE_PROCESSING', { active: !!data.active });
       break;
 
     case 'stopped':
