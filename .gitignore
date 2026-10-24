@@ -21,6 +21,11 @@ pnpm-lock.yaml
 .npm/
 .pnpm-store/
 
+# ===== E2E 测试运行时产物 =====
+e2e/.chrome-profile/
+e2e/.ext-build/
+e2e/downloads/
+
 # ===== 录制输出（开发/测试时可能落地的音视频文件）=====
 *.webm
 *.mp4

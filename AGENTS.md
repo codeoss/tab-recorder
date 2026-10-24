@@ -42,7 +42,7 @@ offscreen.html/js          recorder.html/js（独立 popup 窗口）
 
 - **为什么 tab 录制在 offscreen document**：offscreen 独立于任何窗口存活，popup 关闭、Chrome 最小化都不影响其 `MediaRecorder`（`background.js` 中 `ensureOffscreen()` 创建，reasons: `USER_MEDIA, DISPLAY_MEDIA, AUDIO_PLAYBACK`）
 - **为什么窗口/屏幕录制必须开可见窗口**：`getDisplayMedia` 要求可见页面内的用户手势；该窗口可最小化，媒体流与可见性无关
-- **streamId 跨上下文传递**：`chrome.tabCapture.getMediaStreamId` 只能在 service worker 调用，offscreen 拿到 id 后用 `getUserMedia({ chromeMediaSource: 'tab', chromeMediaSourceId })` 消费
+- **streamId 跨上下文传递**：`chrome.tabCapture.getMediaStreamId` 只能在 service worker 调用。引擎（offscreen / recorder 窗口）在倒计时/选屏结束后发 `GET_STREAM_ID` 现取，background 取好返回，引擎立即用 `getUserMedia({ chromeMediaSource: 'tab', chromeMediaSourceId })` 消费——id 应尽快消费，不要提前取好再等待
 - **防静音回环**：tabCapture 会「劫持」标签页音频导致用户听不到。`offscreen.js` 用 `AudioContext` 把音频接回 `destination`（受 popup 的「录制时保持标签页声音」开关控制）
 - **SW 状态持久化**：`background.js` 把 state 镜像到 `chrome.storage.session`（key: `recorderState`），SW 被回收唤醒后先 `await stateReady` 再路由消息。改动 state 必须走 `setState()` 统一入口
 
@@ -76,9 +76,9 @@ icons/                # 16/48/128 PNG 图标
 
 ## 消息协议（改代码时保持兼容）
 
-- popup → background：`START_RECORDING`（带 `source: 'tab'|'window'|'screen'`、`compatMode`、分辨率/fps/quality/timeLimit/outputFormat/countdownSec 等）、`STOP/PAUSE/RESUME/DISCARD_RECORDING`、`GET_STATE`（1.5s 轮询）
-- background → 录制引擎：`OFF_START`（仅 offscreen，带 streamId）、`OFF_STOP`、`OFF_PAUSE`、`OFF_RESUME`、`OFF_DISCARD`。tab 模式经 `chrome.runtime.sendMessage`（带 `target: 'offscreen'` 过滤）；desktop 模式经 `chrome.tabs.sendMessage(recorderTabId, ...)`
-- 引擎 → background：offscreen 发 `RECORDING_STOPPED`、`FILE_SIZE_UPDATE`、`COUNTDOWN_TICK`；recorder 窗口发 `RECORDER_STARTED`、`RECORDER_STOPPED`、`FILE_SIZE_UPDATE`。停止时带 `historyEntry` 供 background 存历史
+- popup → background：`START_RECORDING`（带 `source: 'tab'|'window'|'screen'`、`compatMode`、分辨率/fps/quality/timeLimit/outputFormat/countdownSec 等；非 idle 或保存处理中时会被拒绝——重入守卫）、`STOP/PAUSE/RESUME/DISCARD_RECORDING`、`GET_STATE`（1.5s 轮询）
+- background → 录制引擎：`OFF_START`（仅 offscreen，带 `tabId`）、`OFF_STOP`、`OFF_PAUSE`、`OFF_RESUME`、`OFF_DISCARD`。tab 模式经 `chrome.runtime.sendMessage`（带 `target: 'offscreen'` 过滤）；desktop 模式经 `chrome.tabs.sendMessage(recorderTabId, ...)`。streamId 不随 OFF_START 下发：`getMediaStreamId` 的 id 应尽快消费，引擎在倒计时/选屏结束后才发 `GET_STREAM_ID`（带 tabId）现取现用
+- 引擎 → background：offscreen 发 `RECORDING_STOPPED`、`FILE_SIZE_UPDATE`、`COUNTDOWN_TICK`、`ENGINE_PROCESSING`（保存/转码链进出，置 `state.processing`）；recorder 窗口发 `RECORDER_STARTED`、`RECORDER_STOPPED`、`FILE_SIZE_UPDATE`、`ENGINE_PROCESSING`、`ENGINE_PAUSED`/`ENGINE_RESUMED`（本地按钮发起的暂停/恢复上行，background 幂等记账）。停止时带 `historyEntry` 供 background 存历史
 
 引擎内部事件（`onEvent` 回调）：`started / paused / resumed / tick / size / processing / stopped / saved`。
 
@@ -102,8 +102,13 @@ WebM 输出与全部录制功能**不依赖**该内核。
 
 ## 测试与验证
 
-**项目没有自动化测试、lint 或 CI。** 验证方式为手工测试：
+**E2E 测试在 `e2e/`**（Playwright + 系统 X11 + xdotool）：`cd e2e && npm i && npm test`。
+覆盖 tab 模式的完整录制、倒计时取消竞态回归、暂停中停止的时长口径。
+两个已知边界：品牌版 Chrome ≥137 禁用 `--load-extension`（E2E 用 Playwright
+自带 Chromium/CfT）；CfT 上 offscreen 偶发被提前回收（rig 局限，生产无此问题）。
+详见 `e2e/run.mjs` 头部注释。
 
+**手工验证仍不可替代**（云桌面兼容模式等需要真实 RDP 环境）：
 - 静态检查：改完 JS 可用 `node --check <file>` 验证语法（注意 worker/offscreen 里的 `chrome.*` API 在 node 下不存在，仅做语法检查）
 - 功能验证按 README 的「🧪 验证清单」逐项手工过：
   - 标签页录制 + 最小化 Chrome 30s → 文件正常且进度条可拖

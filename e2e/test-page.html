@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tab-recorder e2e 测试页</title>
+<style>
+  body { margin: 0; background: #202124; color: #fff; font-family: sans-serif;
+         display: flex; flex-direction: column; align-items: center; }
+  canvas { margin-top: 24px; }
+  #t { font-size: 28px; margin: 24px; }
+</style>
+<body>
+  <div id="t">00:00</div>
+  <canvas id="c" width="640" height="360"></canvas>
+  <script>
+    // 画面：持续变化的动画（tabCapture 抓的是合成器帧，内容变化便于肉眼验证）
+    const ctx = document.getElementById('c').getContext('2d');
+    const t0 = Date.now();
+    setInterval(() => {
+      const el = Date.now() - t0;
+      document.getElementById('t').textContent =
+        new Date(el).toISOString().slice(14, 22);
+      ctx.fillStyle = `hsl(${(el / 20) % 360}, 70%, 45%)`;
+      ctx.fillRect(0, 0, 640, 360);
+      ctx.fillStyle = '#fff'; ctx.font = '36px sans-serif';
+      ctx.fillText(new Date().toISOString(), 30, 200);
+    }, 250);
+
+    // 声音：WebAudio 振荡器。依赖启动参数 --autoplay-policy=no-user-gesture-required，
+    // 否则 AudioContext 会停在 suspended，标签页不产生音频，tabCapture 拿不到音频轨
+    const ac = new AudioContext();
+    const osc = ac.createOscillator();
+    const g = ac.createGain();
+    g.gain.value = 0.04;        // 音量放低，自动化环境无需真听
+    osc.frequency.value = 440;
+    osc.connect(g).connect(ac.destination);
+    osc.start();
+  </script>
+</body>
