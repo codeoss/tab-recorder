@@ -48,11 +48,14 @@
   }
 
   /**
-   * 在 moov 数据区内递归找 stco/co64 表，所有 chunk 偏移 +shift。
+   * 在 moov 数据区内递归找 stco/co64 表并修正 chunk 绝对偏移。
+   * 只修正落在 [shiftFrom, shiftTo) 区间的偏移——moov 搬到第一个 mdat
+   * 之前后，只有这个区间的数据被挤后移；moov 之后的内容（例如第二个
+   * mdat）绝对位置没变，统一 +shift 会改坏多 mdat 布局。
    * 返回 { patched, overflow }：patched=0 说明不是常规 MP4（可能是分片），
    * overflow=true 说明 stco 32 位放不下新偏移，两种都应让调用方回退。
    */
-  function patchChunkOffsets(dv, start, end, shift) {
+  function patchChunkOffsets(dv, start, end, shift, shiftFrom, shiftTo) {
     let patched = 0, overflow = false;
     let cur = start;
     while (cur + 8 <= end) {
@@ -68,19 +71,24 @@
         let p = dataStart + 8;
         for (let i = 0; i < count && p + step <= boxEnd; i++, p += step) {
           if (h.type === 'stco') {
-            const nv = u32(dv, p) + shift;
+            const v = u32(dv, p);
+            if (v < shiftFrom || v >= shiftTo) continue;   // 不在位移区间，跳过
+            const nv = v + shift;
             if (nv > 0xFFFFFFFF) { overflow = true; } else { dv.setUint32(p, nv); patched++; }
           } else {
-            // co64：低 32 位加 shift 并处理进位（shift 为 moov 大小，远小于 2^32）
             const lo = u32(dv, p + 4);
+            const hi = u32(dv, p);
+            const v = hi * 4294967296 + lo;
+            if (v < shiftFrom || v >= shiftTo) continue;   // 同上
+            // co64：低 32 位加 shift 并处理进位（shift 为 moov 大小，远小于 2^32）
             const nlo = lo + shift;
             dv.setUint32(p + 4, nlo >>> 0);
-            dv.setUint32(p, u32(dv, p) + Math.floor(nlo / 4294967296));
+            dv.setUint32(p, hi + Math.floor(nlo / 4294967296));
             patched++;
           }
         }
       } else if (CONTAINERS.has(h.type)) {
-        const r = patchChunkOffsets(dv, dataStart, boxEnd, shift);
+        const r = patchChunkOffsets(dv, dataStart, boxEnd, shift, shiftFrom, shiftTo);
         patched += r.patched; overflow = overflow || r.overflow;
       }
       if (h.size <= 0) break;
@@ -98,11 +106,16 @@
     const total = blob.size;
 
     // 1. 顺序扫描顶层 box 头（每次只读 16 字节），定位 moov / mdat
+    //    前置假设（Chrome MediaRecorder 产物满足）：顶层 box 均为定长 size、
+    //    单 mdat。即使不满足也做了防御：size==0（延伸到文件尾）的 box 会
+    //    用文件剩余长度算出正确 size；多 mdat 由下方的区间修正逻辑覆盖。
     const boxes = [];
     let pos = 0;
     while (pos + 8 <= total) {
       const head = await blob.slice(pos, Math.min(pos + 16, total)).arrayBuffer();
-      const h = boxHeader(new DataView(head), 0, head.byteLength);
+      // end 必须传「文件剩余长度」而非切片长度：size==0 的 box 表示延伸到
+      // 文件尾，按切片长度会把它的 size 误判为 16，后续扫描整体错位
+      const h = boxHeader(new DataView(head), 0, total - pos);
       if (!h || h.size < h.headerLen) break;
       boxes.push({ type: h.type, off: pos, size: h.size });
       pos += h.size;
@@ -119,8 +132,12 @@
     const dv = new DataView(moovBuf);
     const moovHeader = boxHeader(dv, 0, dv.byteLength);
     if (!moovHeader) throw new Error('moov 头解析失败');
+    // moov 自身若写着 size==0（「延伸到文件尾」的合法写法），搬迁后它不再是
+    // 最后一个 box，必须把 size 字段回填为真实大小，否则会吞掉后面的 mdat
+    if (u32(dv, 0) === 0) dv.setUint32(0, moov.size);
     const { patched, overflow } =
-      patchChunkOffsets(dv, moovHeader.headerLen, dv.byteLength, moov.size);
+      patchChunkOffsets(dv, moovHeader.headerLen, dv.byteLength, moov.size,
+                        mdat.off, moov.off);   // 只修正被挤后移的区段
     if (overflow) throw new Error('stco 32 位偏移溢出，无法纯 JS 重排');
     if (patched === 0) throw new Error('moov 内未找到 stco/co64（可能是分片 MP4）');
 
