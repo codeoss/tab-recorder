@@ -151,7 +151,7 @@ npm i @ffmpeg/core@0.12.10
 
 - **MV3 + offscreen document**：规避 service worker 被回收导致的录制中断
 - **`getMediaStreamId` 跨上下文传递**：worker 取 streamId，offscreen 消费
-- **EBML 修复（`fix-webm.js`）**：手写 EBML 解析器重建 `Cues` 索引、修补 `Duration`，纯 JS 无依赖
+- **EBML 修复（`fix-webm.js`）**：手写 EBML 解析器重建 `Cues` 索引、修补 `Duration`，纯 JS 无依赖；流式实现（滑窗扫描 + Blob.slice 拼装），内存与文件大小无关，GB 级长视频不放大内存
 - **分片压缩**：每 60s 合并一次 `chunks`，防止长时间录制内存膨胀
 - **Track `ended` 监听**：用户点 Chrome「停止共享」条时干净收尾
 

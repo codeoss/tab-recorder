@@ -12,6 +12,13 @@
  *   4) Patching Duration in the Info element — or INSERTING one when Chrome
  *      never wrote it (Info grows; cluster offsets in Cues shift accordingly)
  *
+ * All of the above is STREAMING: the file is never fully materialized.
+ * A 256KB sliding window scans sequentially (fixWebMStream), and the output
+ * is assembled from Blob.slice references plus small in-memory patches
+ * (sparse edits). Peak memory is O(window + Cues), independent of file size
+ * — the legacy full-buffer implementation (fixWebM) is kept as the golden
+ * reference for byte-equality tests and is NOT used in production.
+ *
  * After fixing, the file is fully seekable in Chrome, Firefox, VLC, etc.
  */
 
@@ -181,7 +188,11 @@
   };
 
   /* ═══════════════════════════════════════════════════════
-     Main: Parse WebM → Add Cues → Fix Duration
+     LEGACY full-buffer implementation — golden reference only.
+
+     把整个文件物化成 ArrayBuffer（2× 内存放大），仅由
+     e2e/unit-webmstream.mjs 做逐字节 golden 对照用；生产路径走下面的
+     fixWebMStream（流式）。等价性验证一个版本周期后可整体删除。
      ═══════════════════════════════════════════════════════ */
 
   function fixWebM(buf, durationMs) {
@@ -434,15 +445,266 @@
   }
 
   /* ═══════════════════════════════════════════════════════
+     Streaming implementation (production path)
+     ═══════════════════════════════════════════════════════ */
+
+  /**
+   * 窗口读取层：把「整文件一个 DataView」换成按需滑动的 winSize 字节窗口。
+   * readId/readSize/readUint 与全量版语义逐条对齐（越界返回 null /
+   * 抛 RangeError 的行为一致），使 legacy 的解析逻辑得以原样复用。
+   * 窗口不命中才 blob.slice 物化一次（≤winSize），命中时纯内存——
+   * 扫描全程内存与文件大小无关。
+   */
+  function makeWindowReader(blob, winSize) {
+    const total = blob.size;
+    let winStart = 0;
+    let win = new Uint8Array(0);
+
+    async function ensure(off, len) {
+      const end = Math.min(off + len, total);
+      if (off < winStart || end > winStart + win.byteLength) {
+        winStart = off;
+        win = new Uint8Array(await blob.slice(off, Math.min(off + winSize, total)).arrayBuffer());
+      }
+    }
+    const at = (off) => win[off - winStart];
+
+    async function readId(off) {
+      if (off >= total) return null;
+      await ensure(off, 4);            // 近文件尾可能少于 4 字节——只需首字节
+      const b = at(off);
+      let len;
+      if      (b & 0x80) len = 1;
+      else if (b & 0x40) len = 2;
+      else if (b & 0x20) len = 3;
+      else if (b & 0x10) len = 4;
+      else return null;
+      if (off + len > total) return null;
+      await ensure(off, len);
+      let id = 0;
+      for (let i = 0; i < len; i++) id = (id << 8) | at(off + i);
+      return { id: id >>> 0, len };
+    }
+
+    async function readSize(off) {
+      if (off >= total) return null;
+      await ensure(off, 8);
+      const b = at(off);
+      let len = 0, mask = 0;
+      if      (b & 0x80) { len = 1; mask = 0x7F; }
+      else if (b & 0x40) { len = 2; mask = 0x3F; }
+      else if (b & 0x20) { len = 3; mask = 0x1F; }
+      else if (b & 0x10) { len = 4; mask = 0x0F; }
+      else if (b & 0x08) { len = 5; mask = 0x07; }
+      else if (b & 0x04) { len = 6; mask = 0x03; }
+      else if (b & 0x02) { len = 7; mask = 0x01; }
+      else if (b & 0x01) { len = 8; mask = 0x00; }
+      else return null;
+      if (off + len > total) return null;
+      await ensure(off, len);
+      let val = b & mask;
+      for (let i = 1; i < len; i++) val = val * 256 + at(off + i);
+      let allOnes = mask;
+      for (let i = 1; i < len; i++) allOnes = allOnes * 256 + 0xFF;
+      return { val, len, unknown: (val === allOnes) };
+    }
+
+    async function readUint(off, n) {
+      if (off + n > total) {
+        // 与 legacy（DataView.getUint8 越界抛 RangeError → 上层回退原文件）一致
+        throw new RangeError('readUint out of bounds: ' + off + '+' + n + ' > ' + total);
+      }
+      await ensure(off, n);
+      let val = 0;
+      for (let i = 0; i < n; i++) val = val * 256 + at(off + i);
+      return val;
+    }
+
+    return { total, readId, readSize, readUint };
+  }
+
+  /**
+   * 流式扫描（legacy Steps 1-3 的逐行等价移植）：只收集「事实」，不物化文件。
+   * 返回 null 表示 EBML/Segment 头不合法（等价 legacy 原样返回）。
+   */
+  async function scanWebM(rd) {
+    const total = rd.total;
+
+    /* Step 1: Skip EBML Header */
+    let pos = 0;
+    const hdrId = await rd.readId(pos);
+    if (!hdrId || hdrId.id !== ID.EBML_HEADER) return null;
+    pos += hdrId.len;
+    const hdrSz = await rd.readSize(pos);
+    if (!hdrSz) return null;
+    pos += hdrSz.len + hdrSz.val;
+
+    /* Step 2: Enter Segment */
+    const segId = await rd.readId(pos);
+    if (!segId || segId.id !== ID.SEGMENT) return null;
+    pos += segId.len;
+    const segSz = await rd.readSize(pos);
+    if (!segSz) return null;
+    const segSzOff = pos;
+    const segSzLen = segSz.len;
+    pos += segSz.len;
+    const segDataStart = pos;
+    const segEnd = segSz.unknown ? total : Math.min(segDataStart + segSz.val, total);
+
+    /* Step 3: Scan Segment children */
+    const f = {
+      segSzOff, segSzLen, segSzVal: segSz.val, segSzUnknown: segSz.unknown,
+      segDataStart,
+      infoSzOff: 0, infoSzLen: 0, infoDefinite: false, infoDataStart: 0, infoDataEnd: -1,
+      durationDataOff: -1, durationDataLen: 0,
+      timecodeScale: 1000000,
+      clusters: [],   // { absoluteOff, timecodeMs }，relativeOff 编辑阶段再算
+    };
+
+    let cur = segDataStart;
+    while (cur < segEnd - 4) {
+      const elId = await rd.readId(cur);
+      if (!elId) break;
+      const szOff = cur + elId.len;
+      const elSz = await rd.readSize(szOff);
+      if (!elSz) break;
+      const dataOff = szOff + elSz.len;
+
+      if (elId.id === ID.INFO) {
+        f.infoSzOff = szOff;
+        f.infoSzLen = elSz.len;
+        f.infoDefinite = !elSz.unknown;
+        f.infoDataStart = dataOff;
+        f.infoDataEnd = f.infoDefinite ? Math.min(dataOff + elSz.val, total) : -1;
+
+        const infoEnd = elSz.unknown ? segEnd : Math.min(dataOff + elSz.val, total);
+        let ic = dataOff;
+        while (ic < infoEnd - 2) {
+          const cId = await rd.readId(ic);
+          if (!cId) break;
+          const cSzOff = ic + cId.len;
+          const cSz = await rd.readSize(cSzOff);
+          if (!cSz || cSz.unknown) break;
+          const cData = cSzOff + cSz.len;
+
+          if (cId.id === ID.TIMESCALE && cSz.val <= 4) {
+            f.timecodeScale = await rd.readUint(cData, cSz.val);
+          }
+          if (cId.id === ID.DURATION) {
+            f.durationDataOff = cData;
+            f.durationDataLen = cSz.val;
+          }
+          ic = cData + cSz.val;
+        }
+      }
+
+      if (elId.id === ID.CLUSTER) {
+        const tcId = await rd.readId(dataOff);
+        let timecodeMs = 0;
+        if (tcId && tcId.id === ID.TIMECODE) {
+          const tcSz = await rd.readSize(dataOff + tcId.len);
+          if (tcSz) timecodeMs = await rd.readUint(dataOff + tcId.len + tcSz.len, tcSz.val);
+        }
+        f.clusters.push({ absoluteOff: cur, timecodeMs });
+
+        if (elSz.unknown) {
+          let scan = dataOff + 1;
+          while (scan < segEnd - 4) {
+            const peekId = await rd.readId(scan);
+            if (peekId && (
+              peekId.id === ID.CLUSTER || peekId.id === ID.CUES ||
+              peekId.id === ID.INFO || peekId.id === ID.TRACKS
+            )) break;
+            scan++;
+          }
+          cur = scan;
+          continue;
+        }
+      }
+
+      if (elSz.unknown) {
+        cur = dataOff + 1;
+        continue;
+      }
+      cur = dataOff + elSz.val;
+    }
+
+    return f;
+  }
+
+  /**
+   * 流式修复（legacy Steps 4-8 的推广）：所有修改统一表达为稀疏编辑
+   * { off, deleteLen, insert }，随后用 Blob.slice 引用拼装——输出文件
+   * 本体零拷贝。与 fixWebM() 的输出逐字节等价（e2e/unit-webmstream.mjs
+   * golden 钉死）。
+   */
+  async function fixWebMStream(blob, durationMs, winSize) {
+    const rd = makeWindowReader(blob, winSize || (1 << 18));
+    const f = await scanWebM(rd);
+    if (!f || f.clusters.length === 0) return blob;   // 头不合法 / 无 Cluster：原样返回
+
+    const total = blob.size;
+    const durVal = (durationMs * 1000000) / f.timecodeScale;
+
+    /* 编辑 1：Duration 原位改写（Chrome 写了，宽 4/8）或插入（没写）——互斥 */
+    const edits = [];
+    if (f.durationDataOff < 0 && f.infoDefinite && f.infoDataEnd > 0) {
+      const dv8 = new Uint8Array(8);
+      new DataView(dv8.buffer).setFloat64(0, durVal);
+      const durEl = concat(new Uint8Array(ID_BYTES.DURATION), new Uint8Array([0x88]), dv8);
+      const newInfoSize = (f.infoDataEnd - f.infoDataStart) + durEl.byteLength;
+      const capacity = Math.pow(2, 7 * f.infoSzLen) - 2;
+      const newVintLen = newInfoSize <= capacity ? f.infoSzLen : f.infoSzLen + 1;
+      edits.push({ off: f.infoSzOff, deleteLen: f.infoSzLen, insert: encodeVintSizeFixed(newInfoSize, newVintLen) });
+      edits.push({ off: f.infoDataEnd, deleteLen: 0, insert: durEl });
+    } else if (f.durationDataOff >= 0 && (f.durationDataLen === 8 || f.durationDataLen === 4)) {
+      const b = new Uint8Array(f.durationDataLen);
+      if (f.durationDataLen === 8) new DataView(b.buffer).setFloat64(0, durVal);
+      else new DataView(b.buffer).setFloat32(0, durVal);
+      edits.push({ off: f.durationDataOff, deleteLen: f.durationDataLen, insert: b });
+    }
+
+    /* 编辑 2：Cues。cluster 相对偏移先按头部编辑的净增量右移
+       （编辑点都在 Info 一带，位于所有 Cluster 之前） */
+    const headDelta = edits.reduce((s, e) => s + e.insert.byteLength - e.deleteLen, 0);
+    const cuesData = buildCues(f.clusters.map(c => ({
+      relativeOff: c.absoluteOff - f.segDataStart + headDelta,
+      timecodeMs: c.timecodeMs,
+    })));
+
+    /* 编辑 3：Segment size（定长时原宽重写；容量不够则跳过，宁可不动不写坏） */
+    if (!f.segSzUnknown) {
+      const newSegSize = f.segSzVal + cuesData.byteLength + headDelta;
+      const capacity = Math.pow(2, 7 * f.segSzLen) - 2;
+      if (newSegSize <= capacity) {
+        edits.push({ off: f.segSzOff, deleteLen: f.segSzLen, insert: encodeVintSizeFixed(newSegSize, f.segSzLen) });
+      }
+    }
+
+    /* 编辑 4：Cues 追加到文件尾 */
+    edits.push({ off: total, deleteLen: 0, insert: cuesData });
+
+    /* 拼装：编辑点之间全部 Blob.slice 引用，编辑本体是 KB 级小数组 */
+    edits.sort((a, b) => a.off - b.off);
+    const parts = [];
+    let cur = 0;
+    for (const e of edits) {
+      if (e.off > cur) parts.push(blob.slice(cur, e.off));
+      parts.push(e.insert);
+      cur = e.off + e.deleteLen;
+    }
+    if (cur < total) parts.push(blob.slice(cur));
+    return new Blob(parts, { type: blob.type || 'video/webm' });
+  }
+
+  /* ═══════════════════════════════════════════════════════
      Public API
      ═══════════════════════════════════════════════════════ */
 
   async function fixWebMBlob(blob, durationMs) {
     if (!durationMs || durationMs <= 0) return blob;
     try {
-      const buf = await blob.arrayBuffer();
-      const fixed = fixWebM(buf, durationMs);
-      return new Blob([fixed], { type: blob.type || 'video/webm' });
+      return await fixWebMStream(blob, durationMs);
     } catch (e) {
       console.error('WebM fix error:', e);
       return blob;
@@ -450,5 +712,9 @@
   }
 
   G.fixWebMBlob = fixWebMBlob;
+  // 仅供 e2e/unit-webmstream.mjs golden 对照（流式 vs 全量逐字节一致）。
+  // 等价性验证一个版本周期后连同 fixWebM 一起删除。
+  G._fixWebMFullBuffer = fixWebM;
+  G._fixWebMStream = fixWebMStream;
 
 })(self);
