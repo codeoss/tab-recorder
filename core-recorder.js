@@ -177,15 +177,21 @@
       let finalBlob = blob;
 
       if (recordedIsMp4) {
-        // 原生 MP4 录制：文件能播放，但 Chrome 的 MediaRecorder 把 moov atom
-        // 写在末尾，导致播放器必须下载完整文件才能 seek（进度条拖不动）。
-        // 用 ffmpeg -c copy -movflags +faststart 把 moov 搬到开头（流复制，
-        // 不重编码，比转码快一个数量级）。失败则回退到原始 blob（能播不能拖）。
-        // mp4Faststart 内部跑在 Web Worker（见 transcoder.js），不阻塞主线程。
+        // 原生 MP4 录制：Chrome 的 MediaRecorder 把 moov 写在文件末尾，
+        // 播放器必须读到末尾才能 seek/显示时长。
+        // 首选纯 JS faststart（mp4-faststart.js）：只搬 moov 并修正 chunk 偏移，
+        //   内存占用 O(moov 大小)，长视频（GB 级）也能跑；
+        // 兜底 wasm faststart：应对非常规 MP4（JS 版拒绝时）。
+        // 都失败则保留原始 blob（能播放但拖不动）。
         try {
-          finalBlob = await mp4Faststart(blob);
-        } catch (e) {
-          console.warn('MP4 faststart 失败，保留原始文件（进度条可能拖不动）：', e);
+          finalBlob = await mp4FaststartJs(blob);
+        } catch (e1) {
+          console.warn('JS faststart 不适用，尝试 wasm：', e1);
+          try {
+            finalBlob = await mp4Faststart(blob);
+          } catch (e2) {
+            console.warn('MP4 faststart 失败，保留原始文件（进度条可能拖不动）：', e2);
+          }
         }
       } else {
         // WebM：补 Cues 索引 + Duration，使其可拖动进度条

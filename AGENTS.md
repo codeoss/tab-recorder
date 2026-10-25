@@ -63,6 +63,8 @@ core-recorder.js      # 公共录制引擎 createRecorderEngine({ getStream, onE
                       # onStopped 异步链：fix-webm → 可选 MP4 处理 → 触发下载 → 上报历史
 fix-webm.js           # 手写 EBML 解析器：重建 Cues 索引 + 修补 Duration（Chrome 未写
                       # Duration 时向 Info 段插入新元素，并同步后移 Cues 的簇偏移），纯 JS 无依赖。
+mp4-faststart.js      # 纯 JS MP4 faststart：moov 搬到文件头并修正 stco/co64 chunk 偏移。
+                      # Blob.slice 拼装，内存占用 O(moov 大小)，GB 级长视频可用（替代 wasm 方案）
                       # 注释为英文（移植自 ScreenCap Pro v1.4.1），修改时保持英文注释风格
 transcoder.js         # ffmpeg 主线程入口（懒加载）：webmToMp4(blob) / mp4Faststart(blob)，
                       # 内部把任务 postMessage 给 worker；超时随输入大小缩放，超时 terminate 重建
@@ -73,7 +75,7 @@ icons/                # 16/48/128 PNG 图标
 ```
 
 **HTML 脚本加载顺序是硬性依赖**（offscreen.html 与 recorder.html 一致）：
-`fix-webm.js` → `transcoder.js` → `core-recorder.js` → 上下文脚本（`offscreen.js` / `recorder.js`）。core-recorder 运行期依赖前两者暴露的全局 `fixWebMBlob` / `webmToMp4` / `mp4Faststart`。
+`fix-webm.js` → `mp4-faststart.js` → `transcoder.js` → `core-recorder.js` → 上下文脚本（`offscreen.js` / `recorder.js`）。core-recorder 运行期依赖前两者暴露的全局 `fixWebMBlob` / `mp4FaststartJs` / `webmToMp4` / `mp4Faststart`。
 
 ## 消息协议（改代码时保持兼容）
 
@@ -89,17 +91,16 @@ icons/                # 16/48/128 PNG 图标
 
 ```bash
 npm i @ffmpeg/core@0.12.10
-cp node_modules/@ffmpeg/core/dist/ffmpeg-core.{js,wasm} lib/ffmpeg/
+cp node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.{js,wasm} lib/ffmpeg/
 ```
 
 只需这 2 个文件；`ffmpeg-core.worker.js` 是多线程版 `@ffmpeg/core-mt` 的文件，0.12 单线程版不存在也不需要（ffmpeg 跑在扩展自带的 `transcoder-worker.js` 里）。
 
-「输出格式 = MP4」时的三档行为：
-1. Chrome 130+ 原生支持 MP4 录制 + 有内核 → 原生录 H.264/AAC，结束后 `mp4Faststart`（`-c copy` 流复制搬 moov，不重编码）
-2. Chrome 130+ 但无内核 → 原生录制，但 moov 在文件尾，**进度条拖不动**
-3. 老 Chrome 无原生 MP4 → 先录 WebM，结束后 `webmToMp4`（libx264 重编码，慢）；无内核或失败自动回退 `.webm`
+「输出格式 = MP4」时的行为：
+1. 新版 Chrome 原生支持 MP4 录制 → 原生录 H.264/AAC，结束后 `mp4FaststartJs`（纯 JS 搬 moov 到文件头并修正 chunk 偏移，内存 O(moov)，GB 级长视频可用）；非常规 MP4（分片/溢出）时兜底 wasm `mp4Faststart`。**此路径不需要内核**
+2. 老 Chrome 无原生 MP4 → 先录 WebM，结束后 `webmToMp4`（libx264 重编码，慢）；无内核或失败自动回退 `.webm`
 
-WebM 输出与全部录制功能**不依赖**该内核。
+即：内核只服务老版 Chrome 转码与兜底。WebM 输出与全部录制功能**不依赖**该内核。
 
 ## 测试与验证
 

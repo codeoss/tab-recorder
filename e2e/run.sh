@@ -13,4 +13,4 @@ if command -v pactl >/dev/null; then
     pactl load-module module-null-sink sink_name=dummy 2>/dev/null || true
 fi
 
-exec node run.mjs "$@"
+node unit-mp4faststart.mjs && node unit-native-mp4.mjs && node run.mjs "$@"

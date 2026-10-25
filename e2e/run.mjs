@@ -23,6 +23,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { makeCheckMp4 } from './lib-mp4check.mjs';
 
 const E2E_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(E2E_DIR, '..');
@@ -206,6 +207,9 @@ function checkWebM(file, { minMs = 0, maxMs = Infinity } = {}) {
   ok(`Duration 在 [${minMs}, ${maxMs}]ms 区间`, durMs >= minMs && durMs <= maxMs, `实际 ${Math.round(durMs)}ms`);
 }
 
+// MP4 产物校验由 e2e/lib-mp4check.mjs 提供（与 unit-native-mp4.mjs 共用）
+const checkMp4 = makeCheckMp4(ok);
+
 /* ── 启动：拿扩展 id，开测试页和 popup 页 ─────────────── */
 
 console.log('启动 Chrome（headed, DISPLAY=%s）…', process.env.DISPLAY || ':99');
@@ -260,6 +264,13 @@ const ui = {
     const cd = document.getElementById('cd');
     cd.value = v; cd.dispatchEvent(new Event('change'));
   }, String(v)),
+  setFormat: v => popup.evaluate(v => {
+    const f = document.getElementById('fmt');
+    f.value = v; f.dispatchEvent(new Event('change'));
+  }, String(v)),
+  mp4NativeSupported: () => popup.evaluate(() =>
+    ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a', 'video/mp4']
+      .some(m => MediaRecorder.isTypeSupported(m))),   // 与生产 pickFormat 同一降级链
   // VM 上软编码 VP9 很慢（实测 6s@720p 收尾要 6s+），降负载防超时
   setLowRes: () => popup.evaluate(() => {
     const res = document.getElementById('res');
@@ -365,6 +376,23 @@ try {
   const durC = (histC[0]?.duration || '').split(':').reduce((a, p) => a * 60 + Number(p), 0);
   ok('暂停段未计入录制时长', durC >= 1 && durC <= 5,
      `${histC[0]?.duration}（录 3s + 暂停 3s，含暂停则 ≈6s）`);
+
+  /* ── 场景 D：原生 MP4 + JS faststart 全链路 ────────── */
+  console.log('\n场景 D：MP4 输出（原生录制 + 纯 JS faststart，不依赖 ffmpeg 内核）');
+  if (!(await ui.mp4NativeSupported())) {
+    console.log('  ⚠️ 本 Chromium 不支持 MediaRecorder 原生 MP4，跳过');
+  } else {
+    await ui.setFormat('mp4');
+    await ui.setCountdown(0);
+    await ui.clickRec();
+    await waitBgState(s => s.status === 'recording', 'recording');
+    await sleep(4000);
+    await ui.clickRec();
+    await settleAfterStop();
+    const fileD = await waitDownload([fileA, fileB, fileC].filter(Boolean));
+    checkMp4(path.join(DL_DIR, fileD), { minMs: 2500, maxMs: 9000 });
+    await ui.setFormat('webm');   // 还原，避免影响后续场景
+  }
 
   console.log('探针轨迹:', JSON.stringify(await popup.evaluate(() => window.__e2eLogs)));
   console.log(failed === 0 ? '\n全部通过 🎉' : `\n${failed} 项失败 ❌`);
