@@ -63,6 +63,9 @@ core-recorder.js      # 公共录制引擎 createRecorderEngine({ getStream, onE
                       # onStopped 异步链：fix-webm → 可选 MP4 处理 → 触发下载 → 上报历史
 fix-webm.js           # 手写 EBML 解析器：重建 Cues 索引 + 修补 Duration（Chrome 未写
                       # Duration 时向 Info 段插入新元素，并同步后移 Cues 的簇偏移），纯 JS 无依赖。
+                      # 流式实现（生产路径）：256KB 滑窗扫描 + 稀疏编辑 + Blob.slice 拼装，
+                      # 内存 O(窗口+Cues) 与文件大小无关；legacy 全量实现保留为 golden 对照
+                      # （e2e/unit-webmstream.mjs 逐字节等价钉死，验证一个版本周期后删除）。
 mp4-faststart.js      # 纯 JS MP4 faststart：moov 搬到文件头并修正 stco/co64 chunk 偏移。
                       # Blob.slice 拼装，内存占用 O(moov 大小)，GB 级长视频可用（替代 wasm 方案）
                       # 注释为英文（移植自 ScreenCap Pro v1.4.1），修改时保持英文注释风格
