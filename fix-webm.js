@@ -232,6 +232,28 @@
     let timecodeScale = 1000000;
     const clusters = [];              // { absoluteOff, timecodeMs }
     let cur = segDataStart;
+    let infoSeen = false;             // phantom-Info guard: only the first clean Info counts
+
+    // Structural validation of byte-scan candidates: kills same-bytes phantoms
+    // in cluster payloads. A real Cluster's first child is Timecode (E7) with a
+    // non-decreasing value; a real Cues' first child is CuePoint (BB).
+    function validTopElementSync(elIdV, off) {
+      const sz = readSize(dv, off + elIdV.len);
+      if (!sz) return false;
+      const dataOff = off + elIdV.len + sz.len;
+      const childId = readId(dv, dataOff);
+      if (!childId) return false;
+      if (elIdV.id === ID.CLUSTER) {
+        if (childId.id !== ID.TIMECODE) return false;
+        const tcSz = readSize(dv, dataOff + childId.len);
+        if (!tcSz || tcSz.unknown || tcSz.val < 1 || tcSz.val > 8) return false;
+        const tc = readUint(dv, dataOff + childId.len + tcSz.len, tcSz.val);
+        const last = clusters[clusters.length - 1];
+        return !last || tc >= last.timecodeMs;
+      }
+      if (elIdV.id === ID.CUES) return childId.id === ID.CUE_POINT;
+      return false;
+    }
 
     while (cur < segEnd - 4) {
       const elId = readId(dv, cur);
@@ -241,34 +263,48 @@
       if (!elSz) break;
       const dataOff = szOff + elSz.len;
 
-      if (elId.id === ID.INFO) {
+      if (elId.id === ID.INFO && !infoSeen) {
+        // Only trust the FIRST Info, and only if it parses cleanly (well-formed
+        // children filling it exactly, incl. TimecodeScale). A same-bytes
+        // phantom inside Cluster payload fails this check — without it the
+        // phantom overwrites the real Info and Duration gets inserted into
+        // media data (this corrupted a real 632MB recording).
+        infoSeen = true;
         infoOff = cur;
         infoLen = elId.len + elSz.len + (elSz.unknown ? 0 : elSz.val);
-        infoSzOff = szOff;
-        infoSzLen = elSz.len;
-        infoDefinite = !elSz.unknown;
-        infoDataStart = dataOff;
-        infoDataEnd = infoDefinite ? Math.min(dataOff + elSz.val, total) : -1;
+        const iSzOff = szOff, iSzLen = elSz.len;
 
-        // Parse Info children
         const infoEnd = elSz.unknown ? segEnd : Math.min(dataOff + elSz.val, total);
-        let ic = dataOff;
-        while (ic < infoEnd - 2) {
+        let ic = dataOff, clean = !elSz.unknown, sawScale = false;
+        let durOff = -1, durLen = 0, tcs = 1000000;
+        while (clean && ic < infoEnd) {
           const cId = readId(dv, ic);
-          if (!cId) break;
+          if (!cId) { clean = false; break; }
           const cSzOff = ic + cId.len;
           const cSz = readSize(dv, cSzOff);
-          if (!cSz || cSz.unknown) break;
+          if (!cSz || cSz.unknown) { clean = false; break; }
           const cData = cSzOff + cSz.len;
+          if (cData + cSz.val > infoEnd) { clean = false; break; }
 
           if (cId.id === ID.TIMESCALE && cSz.val <= 4) {
-            timecodeScale = readUint(dv, cData, cSz.val);
+            tcs = readUint(dv, cData, cSz.val);
+            sawScale = true;
           }
           if (cId.id === ID.DURATION) {
-            durationDataOff = cData;
-            durationDataLen = cSz.val;
+            durOff = cData;
+            durLen = cSz.val;
           }
           ic = cData + cSz.val;
+        }
+        if (clean && sawScale && ic === infoEnd) {
+          infoSzOff = iSzOff;
+          infoSzLen = iSzLen;
+          infoDefinite = true;
+          infoDataStart = dataOff;
+          infoDataEnd = infoEnd;
+          durationDataOff = durOff;
+          durationDataLen = durLen;
+          timecodeScale = tcs;
         }
       }
 
@@ -296,17 +332,15 @@
 
         // For unknown-size clusters, scan forward to find next top-level element
         if (elSz.unknown) {
-          // Scan byte by byte for next Cluster or known top-level ID
+          // Scan byte by byte for next Cluster or Cues. After clusters have
+          // begun, Info/Tracks cannot legitimately appear (Chrome layout is
+          // fixed) — and every candidate must pass structural validation, so
+          // same-bytes phantoms in payloads no longer derail the scan.
           let scan = dataOff + 1;
           while (scan < segEnd - 4) {
             const peekId = readId(dv, scan);
-            if (peekId && (
-              peekId.id === ID.CLUSTER ||
-              peekId.id === ID.CUES ||
-              peekId.id === ID.INFO ||
-              peekId.id === ID.TRACKS
-            )) {
-              break;
+            if (peekId && (peekId.id === ID.CLUSTER || peekId.id === ID.CUES)) {
+              if (validTopElementSync(peekId, scan)) break;
             }
             scan++;
           }
@@ -580,6 +614,27 @@
       timecodeScale: 1000000,
       clusters: [],   // { absoluteOff, timecodeMs }，relativeOff 编辑阶段再算
     };
+    let infoSeen = false;   // 幻影 Info 防护：只采信第一个且解析干净的 Info
+
+    // 候选顶层元素的结构校验：挡掉负载里的同字节幻影。
+    // 真 Cluster 首子元素必是 Timecode(E7) 且时间码单调不降；真 Cues 首子是 CuePoint(BB)
+    async function validTopElement(elId, off) {
+      const sz = await rd.readSize(off + elId.len);
+      if (!sz) return false;
+      const dataOff = off + elId.len + sz.len;
+      const childId = await rd.readId(dataOff);
+      if (!childId) return false;
+      if (elId.id === ID.CLUSTER) {
+        if (childId.id !== ID.TIMECODE) return false;
+        const tcSz = await rd.readSize(dataOff + childId.len);
+        if (!tcSz || tcSz.unknown || tcSz.val < 1 || tcSz.val > 8) return false;
+        const tc = await rd.readUint(dataOff + childId.len + tcSz.len, tcSz.val);
+        const last = f.clusters[f.clusters.length - 1];
+        return !last || tc >= last.timecodeMs;
+      }
+      if (elId.id === ID.CUES) return childId.id === ID.CUE_POINT;
+      return false;
+    }
 
     let cur = segDataStart;
     while (cur < segEnd - 4) {
@@ -590,31 +645,34 @@
       if (!elSz) break;
       const dataOff = szOff + elSz.len;
 
-      if (elId.id === ID.INFO) {
-        f.infoSzOff = szOff;
-        f.infoSzLen = elSz.len;
-        f.infoDefinite = !elSz.unknown;
-        f.infoDataStart = dataOff;
-        f.infoDataEnd = f.infoDefinite ? Math.min(dataOff + elSz.val, total) : -1;
-
+      if (elId.id === ID.INFO && !infoSeen) {
+        // 只采信第一个 Info，且必须「解析干净」：子元素全部合法、恰好占满、
+        // 含 TimecodeScale。Cluster 负载里的同字节幻影（1549A966 出现在媒体
+        // 数据里）通不过这个校验——否则幻影会覆盖真实 Info，导致 Duration
+        // 被插进媒体数据、正文被改写（实测踩坑，毁了一个 632MB 文件）
+        infoSeen = true;   // 无论通过与否都只试第一个（Chrome 布局里真 Info 是第一个子元素）
         const infoEnd = elSz.unknown ? segEnd : Math.min(dataOff + elSz.val, total);
-        let ic = dataOff;
-        while (ic < infoEnd - 2) {
+        const iSzOff = szOff, iSzLen = elSz.len;
+        let ic = dataOff, clean = !elSz.unknown, sawScale = false;
+        let durOff = -1, durLen = 0;
+        while (clean && ic < infoEnd) {
           const cId = await rd.readId(ic);
-          if (!cId) break;
-          const cSzOff = ic + cId.len;
-          const cSz = await rd.readSize(cSzOff);
-          if (!cSz || cSz.unknown) break;
-          const cData = cSzOff + cSz.len;
-
+          if (!cId) { clean = false; break; }
+          const cSz = await rd.readSize(ic + cId.len);
+          if (!cSz || cSz.unknown) { clean = false; break; }
+          const cData = ic + cId.len + cSz.len;
+          if (cData + cSz.val > infoEnd) { clean = false; break; }
           if (cId.id === ID.TIMESCALE && cSz.val <= 4) {
             f.timecodeScale = await rd.readUint(cData, cSz.val);
+            sawScale = true;
           }
-          if (cId.id === ID.DURATION) {
-            f.durationDataOff = cData;
-            f.durationDataLen = cSz.val;
-          }
+          if (cId.id === ID.DURATION) { durOff = cData; durLen = cSz.val; }
           ic = cData + cSz.val;
+        }
+        if (clean && sawScale && ic === infoEnd) {
+          f.infoSzOff = iSzOff; f.infoSzLen = iSzLen;
+          f.infoDefinite = true; f.infoDataStart = dataOff; f.infoDataEnd = infoEnd;
+          f.durationDataOff = durOff; f.durationDataLen = durLen;
         }
       }
 
@@ -633,10 +691,11 @@
             // 同步快路径优先：窗口命中时不付微任务开销；跨窗口才 await 物化
             let peekId = rd.readIdSync(scan);
             if (peekId === undefined) peekId = await rd.readId(scan);
-            if (peekId && (
-              peekId.id === ID.CLUSTER || peekId.id === ID.CUES ||
-              peekId.id === ID.INFO || peekId.id === ID.TRACKS
-            )) break;
+            // 已开始收 Cluster 后，Info/Tracks 不可能合法出现（Chrome 布局固定）；
+            // 只认 CLUSTER/CUES 且必须过结构校验——负载里的同字节幻影不再误判
+            if (peekId && (peekId.id === ID.CLUSTER || peekId.id === ID.CUES)) {
+              if (await validTopElement(peekId, scan)) break;
+            }
             scan++;
           }
           cur = scan;

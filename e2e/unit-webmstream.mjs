@@ -234,5 +234,26 @@ await golden('200KB 负载 Cluster',
   ok('fixWebMBlob 路由到流式实现', a.equals(b));
 }
 
+/* 12. 幻影防护回归（对应真实踩坑：632MB 文件的负载里埋了 1549A966 幻影，
+   旧扫描器出轨 → Duration 插进媒体数据、Cues 偏移错位、覆盖截断）：
+   负载里埋幻影 Info + 假 Cluster 头（首子非 E7），扫描不得出轨 */
+{
+  const phantomInfo = new Uint8Array([0x15, 0x49, 0xA9, 0x66, 0x3D, 0x4F, 0xCB, 0xDE, 0xAD]);
+  const fakeCluster = cat(
+    new Uint8Array([0x1F, 0x43, 0xB6, 0x75, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+    new Uint8Array([0x99, 0x99]),   // 首子不是 Timecode(E7) → 假 Cluster
+  );
+  const payload = cat(new Uint8Array(64), phantomInfo, new Uint8Array(64), fakeCluster, new Uint8Array(64));
+  const bytes = wrapUnknown([
+    info({}), tracks,
+    cat(elUnknown(CLUSTER), cat(el(TIMECODE, uintBytes(0)), payload)),
+    cluster(1000), cluster(2000),
+  ]);
+  const legacy = await golden('幻影防护（Info/假Cluster）', bytes, 2500);
+  const hex = Buffer.from(legacy).toString('hex');
+  ok('  · Duration 插在真实 Info（文件头 128 字节内）', hex.slice(0, 256).includes('4489'));
+  ok('  · 末簇时间码 2000ms 被收录（扫描未出轨）', hex.includes('b38207d0'));
+}
+
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n全部通过 🎉');
 process.exit(failed ? 1 : 0);
