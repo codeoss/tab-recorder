@@ -84,6 +84,10 @@ tab-recorder-ext/
 | 新版 Chrome 但 JS faststart 不适用（非常规 MP4） | 用 ffmpeg 内核做 faststart 兜底 | 可拖动的 `.mp4` |
 | 老版本 Chrome（无原生 MP4） | 先录 WebM，结束后用 ffmpeg 内核转码（慢，长视频可达数十分钟） | 可拖动的 `.mp4`；无内核或转码失败回退 `.webm` |
 
+> **PotPlayer 打开 MP4 很慢？** 中间版本的 Chrome 原生 MP4 是分片式（fMP4）且不带 mfra 索引，PotPlayer 等弱 fMP4 播放器要逐分片扫描才能建索引，大文件打开很慢。用 ffmpeg 重封装一次即可（流复制，不重编码，秒级）：
+> `ffmpeg -i 录制的.mp4 -c copy -movflags +faststart 修复后.mp4`
+> Chrome ≥153 的产物自带 mfra，无此问题；VLC / mpv 也不受影响。
+
 可见：新版 Chrome 下 MP4 开箱即用（原生录制 + 内置 JS faststart）；**ffmpeg 内核只用于**老版 Chrome 的整段转码、以及非常规 MP4 的 faststart 兜底。内核体积较大（约 30MB）且为 GPL-2.0-or-later 许可（内含 libx264），故未随扩展打包。两种放入方式任选其一：
 
 **方式 A：npm 下载**
