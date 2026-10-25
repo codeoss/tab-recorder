@@ -18,7 +18,7 @@
 | ⏱️ 倒计时 | 录制前可选 3/5/10 秒倒计时 |
 | ⏸️ 暂停 / 恢复 / 丢弃 | 录制中可暂停、恢复或丢弃 |
 | 🎬 WebM 输出 | 原生 `MediaRecorder`，并修复 EBML 索引使其可拖动进度条 |
-| 📦 可选 MP4 输出 | 新版 Chrome 原生录 H.264/AAC；老版本用 ffmpeg.wasm 转码（内核需自行放入，见下） |
+| 📦 可选 MP4 输出 | 新版 Chrome 原生录制（编码随平台：Win/macOS 为 H.264/AAC，Linux 为 VP9/Opus-in-MP4）；老版本用 ffmpeg.wasm 转码 |
 | ☁️ 云桌面兼容模式 | RDP/云桌面下 tabCapture 音频劫持失效时的兜底方案 |
 | 📜 历史记录 | 最近 5 次录制展示在弹窗 |
 
@@ -80,11 +80,11 @@ tab-recorder-ext/
 
 | 环境 | 行为 | 产物 |
 |---|---|---|
-| 新版 Chrome（原生支持 MP4 录制）＋ 已放入内核 | 原生录 H.264/AAC，结束后用 ffmpeg 做 **faststart**（流复制搬 moov，不重编码，秒级） | 可拖动的 `.mp4` |
-| 新版 Chrome 但未放入内核 | 原生录制，但无法修 moov 位置 | 能播放、**进度条拖不动**的 `.mp4` |
-| 老版本 Chrome（无原生 MP4） | 先录 WebM，结束后用 ffmpeg 转码（慢，长视频可达数十分钟） | 可拖动的 `.mp4`；无内核或转码失败回退 `.webm` |
+| 新版 Chrome（原生支持 MP4 录制） | 原生录制，结束后用内置纯 JS（`mp4-faststart.js`）搬 moov 到文件头，内存占用与文件大小无关，长视频也适用 | 可拖动的 `.mp4`，**无需内核** |
+| 新版 Chrome 但 JS faststart 不适用（非常规 MP4） | 用 ffmpeg 内核做 faststart 兜底 | 可拖动的 `.mp4` |
+| 老版本 Chrome（无原生 MP4） | 先录 WebM，结束后用 ffmpeg 内核转码（慢，长视频可达数十分钟） | 可拖动的 `.mp4`；无内核或转码失败回退 `.webm` |
 
-可见无论哪条路径，想要「可用的 MP4」都离不开 ffmpeg 内核（faststart 或转码），建议按下文放入。内核体积较大（约 30MB）且为 GPL-2.0-or-later 许可（内含 libx264），故未随扩展打包。两种放入方式任选其一：
+可见：新版 Chrome 下 MP4 开箱即用（原生录制 + 内置 JS faststart）；**ffmpeg 内核只用于**老版 Chrome 的整段转码、以及非常规 MP4 的 faststart 兜底。内核体积较大（约 30MB）且为 GPL-2.0-or-later 许可（内含 libx264），故未随扩展打包。两种放入方式任选其一：
 
 **方式 A：npm 下载**
 
