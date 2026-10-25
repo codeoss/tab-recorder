@@ -520,7 +520,27 @@
       return val;
     }
 
-    return { total, readId, readSize, readUint };
+    // 同步快路径：窗口命中时与 readId 语义逐条一致；未命中/跨界返回 undefined
+    // （调用方回退到 await readId）。unknown-size Cluster 前扫每字节都调它，
+    // 没有这个快路径时每个字节都要付一次微任务开销（实测大文件慢 ~14 倍）
+    function readIdSync(off) {
+      if (off >= total) return null;
+      if (off < winStart || off + 4 > winStart + win.byteLength) return undefined;
+      const b = win[off - winStart];
+      let len;
+      if      (b & 0x80) len = 1;
+      else if (b & 0x40) len = 2;
+      else if (b & 0x20) len = 3;
+      else if (b & 0x10) len = 4;
+      else return null;
+      if (off + len > total) return null;
+      if (off + len > winStart + win.byteLength) return undefined;
+      let id = 0;
+      for (let i = 0; i < len; i++) id = (id << 8) | win[off - winStart + i];
+      return { id: id >>> 0, len };
+    }
+
+    return { total, readId, readSize, readUint, readIdSync };
   }
 
   /**
@@ -610,7 +630,9 @@
         if (elSz.unknown) {
           let scan = dataOff + 1;
           while (scan < segEnd - 4) {
-            const peekId = await rd.readId(scan);
+            // 同步快路径优先：窗口命中时不付微任务开销；跨窗口才 await 物化
+            let peekId = rd.readIdSync(scan);
+            if (peekId === undefined) peekId = await rd.readId(scan);
             if (peekId && (
               peekId.id === ID.CLUSTER || peekId.id === ID.CUES ||
               peekId.id === ID.INFO || peekId.id === ID.TRACKS
