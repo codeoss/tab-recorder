@@ -76,6 +76,7 @@ transcoder.js         # ffmpeg 主线程入口（懒加载）：webmToMp4(blob) 
 transcoder-worker.js  # Web Worker 宿主：importScripts 加载 ffmpeg-core.js、callMain 跑转码、
                       # 单例 core 实例跨任务复用。worker 内无 chrome.* API，coreURL 由主线程传入
 lib/ffmpeg/           # ffmpeg.wasm 内核存放处（默认只有 README.txt，内核不进版本库）
+docs/                 # 分析与实验记录（如 wmp-seek-2026-10/：WMP 拖动问题的完整排查过程+工具）
 icons/                # 16/48/128 PNG 图标
 ```
 
