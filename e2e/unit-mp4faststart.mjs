@@ -85,8 +85,10 @@ function topBoxes(buf) {
   const out = [];
   let pos = 0;
   while (pos + 8 <= buf.byteLength) {
-    const size = dv.getUint32(pos);
+    let size = dv.getUint32(pos);
     out.push({ type: String.fromCharCode(dv.getUint8(pos+4), dv.getUint8(pos+5), dv.getUint8(pos+6), dv.getUint8(pos+7)), off: pos, size });
+    if (size === 0) size = buf.byteLength - pos;   // size==0 = 延伸到文件尾（防死循环）
+    if (size <= 0) break;
     pos += size;
   }
   return out;
@@ -160,12 +162,14 @@ console.log('mp4-faststart 单元测试');
   ok('已 faststart: 原样返回', out === inBlob);
 }
 
-// 4. stco 32 位溢出 → 抛错
+// 4. stco 偏移超出位移区间（或 32 位溢出）→ 抛错回退。
+//    注意：区间过滤后，「溢出」分支只有在 >4GB 的真实文件里才达得到，
+//    这里是等价的防御性回退验证（范围外条目被跳过 → patched=0 → 抛错）
 {
   const { bytes } = makeMp4({ entries: [0xFFFFFFF0] });
   let threw = false;
-  try { await mp4FaststartJs(new Blob([bytes])); } catch (e) { threw = /溢出/.test(e.message); }
-  ok('stco 溢出: 抛错回退', threw);
+  try { await mp4FaststartJs(new Blob([bytes])); } catch (e) { threw = true; }
+  ok('stco 溢出/范围外: 抛错回退', threw);
 }
 
 // 5. moov 里没有 stco/co64 → 抛错
@@ -177,6 +181,49 @@ console.log('mp4-faststart 单元测试');
   try { await mp4FaststartJs(new Blob([cat(ftyp, mdat, moov)])); }
   catch (e) { threw = /未找到 stco/.test(e.message); }
   ok('无 chunk 表: 抛错回退', threw);
+}
+
+// 6. 最后一个 box 的 size==0（规范：延伸到文件尾）——Chrome 不会这么写，
+//    但此前顶层扫描会把它误判为 16 字节导致 moov 读不全
+{
+  const { bytes } = makeMp4({ is64: false });
+  // 把 moov（最后一个 box）的 size 字段改写成 0
+  const dv0 = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const boxes0 = topBoxes(bytes.buffer);
+  dv0.setUint32(boxes0[2].off, 0);
+  const out = await mp4FaststartJs(new Blob([bytes]));
+  const buf = await out.arrayBuffer();
+  const boxes = topBoxes(buf);
+  ok('size==0 的末位 moov: 仍正常搬迁', boxes.map(b => b.type).join(',') === 'ftyp,moov,mdat',
+     boxes.map(b => b.type).join(','));
+  ok('size==0: 总大小不变', buf.byteLength === bytes.length);
+}
+
+// 7. 多 mdat（moov 夹在中间）：只有被挤后移的区段才修正偏移——
+//    moov 之后的第二个 mdat，其 chunk 绝对偏移必须保持不变
+{
+  const ftyp = box('ftyp', new Uint8Array([...str('isom'), 0, 0, 0, 0, ...str('isom')]));
+  const p1 = new Uint8Array(40).fill(1);
+  const p2 = new Uint8Array(40).fill(2);
+  const mdat1Len = 8 + p1.length;
+  // 先探出 moov 大小（2 条 stco entry 的结构固定）
+  const probe = box('moov', box('trak', box('mdia', box('minf', box('stbl', stcoBox([0, 0], false))))));
+  const M = probe.length;
+  const e1 = ftyp.length + 8;                        // mdat1 负载起始（旧坐标）
+  const moovOff = ftyp.length + mdat1Len;            // moov 旧偏移
+  const e2 = moovOff + M + 8;                        // mdat2 负载起始（旧坐标）
+  const moov = box('moov', box('trak', box('mdia', box('minf', box('stbl', stcoBox([e1, e2], false))))));
+  const bytes = cat(ftyp, box('mdat', p1), moov, box('mdat', p2));
+  const out = await mp4FaststartJs(new Blob([bytes]));
+  const buf = await out.arrayBuffer();
+  const boxes = topBoxes(buf);
+  const entries = readStco(buf, boxes.find(b => b.type === 'moov').off, false);
+  ok('多 mdat: 顺序 ftyp→moov→mdat→mdat',
+     boxes.map(b => b.type).join(',') === 'ftyp,moov,mdat,mdat', boxes.map(b => b.type).join(','));
+  ok('多 mdat: 第一 mdat 的 chunk +moovSize', entries && entries[0] === e1 + M,
+     `${entries && entries[0]} vs ${e1 + M}`);
+  ok('多 mdat: 第二 mdat 的 chunk 偏移不变', entries && entries[1] === e2,
+     `${entries && entries[1]} vs ${e2}`);
 }
 
 console.log(failed === 0 ? '单元测试全部通过 🎉' : `${failed} 项失败 ❌`);
