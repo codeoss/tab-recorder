@@ -66,6 +66,8 @@ fix-webm.js           # 手写 EBML 解析器：重建 Cues 索引 + 修补 Dura
                       # 流式实现（生产路径）：256KB 滑窗扫描 + 稀疏编辑 + Blob.slice 拼装，
                       # 内存 O(窗口+Cues) 与文件大小无关；legacy 全量实现保留为 golden 对照
                       # （e2e/unit-webmstream.mjs 逐字节等价钉死，验证一个版本周期后删除）。
+                      # 幻影防护：只采信第一个解析干净的 Info；Cluster 前扫的候选须过结构校验
+                      # （否则负载里的同字节幻影会出轨扫描、把编辑写进媒体数据——真实踩坑）
 mp4-faststart.js      # 纯 JS MP4 faststart：moov 搬到文件头并修正 stco/co64 chunk 偏移。
                       # Blob.slice 拼装，内存占用 O(moov 大小)，GB 级长视频可用（替代 wasm 方案）
                       # 注释为英文（移植自 ScreenCap Pro v1.4.1），修改时保持英文注释风格
