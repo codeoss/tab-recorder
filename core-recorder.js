@@ -8,7 +8,7 @@
  *   - onStopped 异步链：fix-webm → 可选 mp4 转码 → 下载 → 上报历史
  *   - elapsed 计时、pickFormat、fmtDur 等纯工具
  *
- * 通过两个钩子由调用方注入「上下文相关」的差异：
+ * 通过三个钩子由调用方注入「上下文相关」的差异：
  *   getStream(opts) → Promise<MediaStream>
  *       取流逻辑。tab 模式走 tabCapture，desktop 走 getDisplayMedia，
  *       兼容模式合成双流。
@@ -16,15 +16,18 @@
  *       状态回调。调用方据此更新 UI / 通知 background。
  *   releaseExtra()（可选）
  *       释放本上下文额外持有的资源（如兼容模式的 screenAudioStream）。
+ *   saveFile(blob, filename) → Promise<{filename, path}>
+ *       由 background 确认真实落盘；完成前不得上报 saved/成功历史。
  *
  * 暴露全局：createRecorderEngine(options) → engine
- *   engine.start(opts) / .stop() / .pause() / .resume() / .discard()
- *   engine.isRecording() / .isBusy()   // 录制中？处理中（关窗会丢视频）？
+ *   engine.start(opts) / .stop() / .pause() / .resume() / .discard() / .retrySave()
+ *   engine.isRecording() / .isBusy()   // 录制、保存及失败待处理均为 busy
  *
  * 依赖（调用方 HTML 里要先加载）：
  *   fix-webm.js → fixWebMBlob
  *   transcoder.js → webmToMp4（webm 转 mp4 时用）/ mp4Faststart（原生 mp4 修 faststart 时用）
  *                  （两者内部都跑在 Web Worker，转码期间主线程不阻塞）
+ *   save-file.js → saveFileViaBackground（创建 Blob URL 并等待下载终态）
  */
 
 (function (G) {
@@ -35,8 +38,9 @@
    * @param {(opts: Object) => Promise<MediaStream>} opts.getStream
    * @param {(name: string, data?: Object) => void} [opts.onEvent]
    * @param {() => void} [opts.releaseExtra]
+   * @param {(blob: Blob, filename: string) => Promise<{filename: string, path: string}>} opts.saveFile
    */
-  function createRecorderEngine({ getStream, onEvent, releaseExtra }) {
+  function createRecorderEngine({ getStream, onEvent, releaseExtra, saveFile }) {
     const emit = (name, data) => { try { onEvent && onEvent(name, data); } catch (_) {} };
 
     // ── 引擎状态 ─────────────────────────────────────────
@@ -54,6 +58,8 @@
     let paused_ = false;        // 是否处于暂停态（内部状态，外部用 isPaused() 查询）
     let isProcessing = false;   // onStopped 异步链进行中：关窗会丢视频
     let discarded = false;      // 处理中被丢弃：onStopped 链跑完后不下载、不写历史
+    let pendingSave = null;     // 已整理完成、等待下载成功/重试/丢弃的最终产物
+    let saveInFlight = false;   // saveFile Promise 尚未到终态，禁止并发重试
     let limitMs = 0;
     let outputFormat = 'webm';
 
@@ -68,6 +74,8 @@
       outputFormat = opts.outputFormat || 'webm';
       isProcessing = false;
       discarded = false;
+      pendingSave = null;
+      saveInFlight = false;
 
       const recStream = await getStream(opts);
       if (!recStream) return false;   // 取流失败，调用方已在 onEvent('error') 上报
@@ -145,6 +153,14 @@
       chunks = [];
       if (stopTimer)  { clearTimeout(stopTimer);  stopTimer = null; }
       if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
+      if (pendingSave && !saveInFlight) {
+        pendingSave = null;
+        isProcessing = false;
+        releaseAll();
+        emit('processing', { active: false });
+        emit('stopped', { historyEntry: null, discarded: true });
+        return;
+      }
       if (recorder && recorder.state !== 'inactive') {
         recorder.ondataavailable = null;
         recorder.onstop = null;
@@ -156,10 +172,54 @@
 
     /* ── 录制结束：修复 WebM → 可选 MP4 转码 → 下载 ─── */
 
+    async function persistFinalBlob() {
+      if (!pendingSave || saveInFlight || discarded) return false;
+      saveInFlight = true;
+      const job = pendingSave;
+      try {
+        emit('processing', { active: true, stage: 'download' });
+        const result = await saveFile(job.blob, job.filename);
+        if (discarded) {
+          pendingSave = null;
+          isProcessing = false;
+          saveInFlight = false;
+          emit('processing', { active: false });
+          return true;
+        }
+        const filename = (result && result.filename) || job.filename;
+        const historyEntry = {
+          filename, size: job.blob.size,
+          duration: fmtDur(job.durMs), date: new Date().toLocaleString('zh-CN'),
+          format: job.blob.type.includes('mp4') ? 'mp4' : 'webm',
+        };
+        pendingSave = null;
+        emit('stopped', { historyEntry });
+        emit('saved', { filename });
+        isProcessing = false;
+        saveInFlight = false;
+        emit('processing', { active: false });
+        return true;
+      } catch (error) {
+        saveInFlight = false;
+        if (discarded) {
+          pendingSave = null;
+          isProcessing = false;
+          emit('processing', { active: false });
+          return true;
+        }
+        emit('saveerror', { message: error.message || String(error) });
+        return false;
+      }
+    }
+
+    async function retrySave() {
+      if (!pendingSave || saveInFlight || discarded) return false;
+      return await persistFinalBlob();
+    }
+
     async function onStopped() {
       releaseAll(); stopTick();
       isProcessing = true;
-      emit('processing', { active: true });
 
       if (!chunks.length) {
         isProcessing = false;
@@ -171,18 +231,14 @@
       const durMs = elapsed();
       let blob = new Blob(chunks, { type: mime });
       chunks = [];
+      emit('processing', { active: true, stage: recordedIsMp4 ? 'mp4-fix' : 'webm-fix' });
 
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
       let filename = recordedIsMp4 ? `TabRecord_${ts}.mp4` : `TabRecord_${ts}.webm`;
       let finalBlob = blob;
 
       if (recordedIsMp4) {
-        // 原生 MP4 录制：Chrome 的 MediaRecorder 把 moov 写在文件末尾，
-        // 播放器必须读到末尾才能 seek/显示时长。
-        // 首选纯 JS faststart（mp4-faststart.js）：只搬 moov 并修正 chunk 偏移，
-        //   内存占用 O(moov 大小)，长视频（GB 级）也能跑；
-        // 兜底 wasm faststart：应对非常规 MP4（JS 版拒绝时）。
-        // 都失败则保留原始 blob（能播放但拖不动）。
+        // 原生 MP4：faststart / fMP4 时长修补；非常规布局才回退 wasm。
         try {
           finalBlob = await mp4FaststartJs(blob);
         } catch (e1) {
@@ -194,14 +250,12 @@
           }
         }
       } else {
-        // WebM：补 Cues 索引 + Duration，使其可拖动进度条
+        // WebM：补 SeekHead/Cues/Duration，使 Chrome 与 WMP 均可拖动
         try { blob = await fixWebMBlob(blob, durMs); } catch (e) { console.warn(e); }
         finalBlob = blob;
 
-        // 用户要 MP4 但原生不支持 → ffmpeg.wasm 转码
-        // webmToMp4 内部跑在 Web Worker（见 transcoder.js），转码期间引擎
-        // 仍可响应 OFF_STOP 等消息；onEvent('processing') 让 UI 提示「转码中」。
         if (outputFormat === 'mp4') {
+          emit('processing', { active: true, stage: 'transcode' });
           try {
             finalBlob = await webmToMp4(blob);
             filename = `TabRecord_${ts}.mp4`;
@@ -211,25 +265,14 @@
         }
       }
 
-      // 处理期间用户点了「丢弃」：静默收尾，不下载、不写历史
       if (discarded) {
         isProcessing = false;
         emit('processing', { active: false });
         return;
       }
 
-      dl(finalBlob, filename);
-      emit('stopped', {
-        historyEntry: {
-          filename, size: finalBlob.size,
-          duration: fmtDur(durMs), date: new Date().toLocaleString('zh-CN'),
-          format: finalBlob.type.includes('mp4') ? 'mp4' : 'webm',
-        },
-      });
-      emit('saved', { filename });
-
-      isProcessing = false;
-      emit('processing', { active: false });
+      pendingSave = { blob: finalBlob, filename, durMs };
+      await persistFinalBlob();
     }
 
     /* ── 计时 ────────────────────────────────────────── */
@@ -280,12 +323,6 @@
 
     function compact() { if (chunks.length > 120) chunks = [new Blob(chunks, { type: mime })]; }
 
-    function dl(blob, name) {
-      const u = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href = u; a.download = name; a.click();
-      setTimeout(() => URL.revokeObjectURL(u), 30000);
-    }
-
     function fmtDur(ms) {
       const s = Math.max(0, Math.floor(ms / 1000));
       return [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60]
@@ -308,7 +345,7 @@
     function isBusy()      { return isRecording() || isProcessing; }
 
     return {
-      start, stop, pause, resume, discard,
+      start, stop, pause, resume, discard, retrySave,
       isRecording, isBusy, isPaused: () => paused_,
     };
   }

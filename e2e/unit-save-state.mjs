@@ -122,7 +122,8 @@ async function processing(h, stage = 'webm-fix') {
   ok('完成下载仍等待引擎收尾', stateComplete.savePhase === 'complete' && stateComplete.processing === true);
 
   await h.send('RECORDING_STOPPED', { historyEntry: { filename: complete.filename, size: 100 } });
-  ok('引擎收尾后解除 processing', (await h.send('GET_STATE')).processing === false);
+  const finished = await h.send('GET_STATE');
+  ok('引擎收尾后解除 processing 和 retry 状态', finished.processing === false && finished.saveCanRetry === false);
   ok('成功历史在引擎确认后写入', h.local.recordingHistory?.[0]?.filename === 'a (1).webm');
 }
 

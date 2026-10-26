@@ -116,6 +116,7 @@ async function startRecording() {
     getStream: () => getCaptureStream(),
     onEvent:   (name, data) => onEvent(name, data),
     releaseExtra: () => releaseExtraStreams(),
+    saveFile: (blob, filename) => saveFileViaBackground(blob, filename),
   });
 
   const ok = await engine.start({
@@ -268,11 +269,18 @@ function onEvent(name, data) {
         stxt.textContent = '处理中...（转码中请勿关闭窗口）';
         dot.style.animation = 'none';
       }
-      notifyBg('ENGINE_PROCESSING', { active: !!data.active });
+      notifyBg('ENGINE_PROCESSING', { active: !!data.active, stage: data.stage });
+      break;
+
+    case 'saveerror':
+      notifyBg('ENGINE_SAVE_ERROR', { message: data && data.message, canRetry: true });
       break;
 
     case 'stopped':
-      notifyBg('RECORDER_STOPPED', { historyEntry: data && data.historyEntry });
+      notifyBg('RECORDER_STOPPED', {
+        historyEntry: data && data.historyEntry,
+        discarded: !!(data && data.discarded),
+      });
       if (data && data.historyEntry) {
         // 正常停止：等 saved 事件再关窗
       } else {

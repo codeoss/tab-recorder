@@ -256,8 +256,25 @@ async function route(msg) {
     case 'RECORDING_STOPPED':
     case 'RECORDER_STOPPED': {
       setState({ status: 'idle', fileSize: 0, recorderWindowId: 0, recorderTabId: 0, processing: false });
+      if (msg.discarded) {
+        resetSaveResult();
+      } else if (msg.historyEntry) {
+        setState({ savePhase: 'complete', saveCanRetry: false });
+        saveHistory(msg.historyEntry);
+      }
       badge('idle');
-      if (msg.historyEntry) saveHistory(msg.historyEntry);
+      return { ok: 1 };
+    }
+
+    case 'ENGINE_SAVE_ERROR': {
+      const canRetry = msg.canRetry !== false;
+      setState({
+        processing: canRetry,
+        savePhase: 'error',
+        processingStage: '',
+        saveError: msg.message || '保存失败',
+        saveCanRetry: canRetry,
+      });
       return { ok: 1 };
     }
 

@@ -87,8 +87,8 @@ patch('core-recorder.js', `      if (recorder && recorder.state !== 'inactive') 
   RELAY(`'engine.stop state='+(recorder&&recorder.state)`) + '\n', { prepend: true });
 patch('core-recorder.js', `      releaseAll(); stopTick();\n      isProcessing = true;`,
   RELAY(`'onStopped enter chunks='+chunks.length`) + '\n', { prepend: true });
-patch('core-recorder.js', `      dl(finalBlob, filename);`,
-  RELAY(`'onStopped before-dl'`) + '\n', { prepend: true });
+patch('core-recorder.js', `      await persistFinalBlob();`,
+  RELAY(`'onStopped before-save'`) + '\n', { prepend: true });
 patch('core-recorder.js', `      emit('started', { timeLimit: opts.timeLimit || 0 });`,
   RELAY(`'engine started rstate='+recorder.state`) + '\n', { prepend: true });
 // offscreen 侧：OFF_* 到达与 doStart 代次
