@@ -6,6 +6,8 @@
  *   2. 消息路由：把 popup 的指令分发给 offscreen / recorder 窗口
  *   3. 通过 chrome.tabCapture.getMediaStreamId 取得 streamId 并跨上下文传递
  *   4. 管理录制窗口生命周期与历史记录
+ *   5. 通过 chrome.downloads 确认真实落盘，维护保存阶段、进度和失败重试状态；
+ *      tab 停止后打开 save-status.html，避免 popup 关闭后用户看不到保存进度
  *
  * 为什么 service worker 不直接录制？
  *   - MV3 worker 会被系统回收，无法长时间持有 MediaRecorder。

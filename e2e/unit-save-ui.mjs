@@ -1,3 +1,7 @@
+/**
+ * 验证 save-status 页面：整理/下载/完成/失败各阶段、真实进度、
+ * beforeunload 防护、完成自动关窗，以及重试和明确丢弃。
+ */
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';

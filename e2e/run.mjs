@@ -7,14 +7,14 @@
  *
  * 覆盖场景：
  *   A. 完整录制：倒计时 0 → 录 6s → 停止 → 校验产物（EBML/Opus/Cues/Duration）
- *   B. 倒计时取消竞态回归：10s 倒计时 → 取消 → 立即重开 → 再取消 → 第三次
- *      正常录成。覆盖 fix/recorder-lifecycle 修掉的「孤儿录制」竞态
- *      （旧 bug：取消后 1s 内重开会让旧启动复活，之后所有录制被 isBusy 挡死）
- *   C. 暂停态直接停止：录 3s → 暂停 3s → 暂停中停止 → Duration 应 ≈3s 而非 6s
- *      （fix-webm 的 Duration 不该把暂停尾巴算进去）
+ *   B. 倒计时取消竞态回归：取消后立即重开，验证无孤儿录制/状态 wedge
+ *   C. 暂停态直接停止：Duration 不含暂停段
+ *   D. 原生 MP4：faststart/fMP4 时长修补与真实下载
+ *   E. 保存状态可见：延迟下载、popup 关闭、进度窗口恢复、失败重试与明确丢弃
  *
- * 产物校验不依赖 ffprobe，直接读二进制：
- *   EBML 魔数 / Cues 元素(0x1C53BB6B) / Opus 轨(A_OPUS) / Duration 元素(0x4489)
+ * 产物校验不依赖 ffprobe，直接读二进制：EBML/SeekHead/Cues/Duration、MP4 box/时长。
+ * Windows 无 xdotool 时可设 E2E_MANUAL_SHORTCUT=1，在提示后真实按 Ctrl+Shift+E；
+ * NATIVE_CHROME_BIN 单独指定品牌 Chrome 的原生 MP4 测试路径。
  */
 
 import { chromium } from 'playwright';
@@ -34,6 +34,8 @@ const DL_DIR = path.join(E2E_DIR, 'downloads');
 // 04f6233，build flag 写死，无 flag 可解），只能用 Playwright 自带的 Chromium。
 // 留空 executablePath 即用 ~/.cache/ms-playwright 下的 Chromium。
 const CHROME = process.env.CHROME_BIN || '';
+const RECORD_A_SECONDS = Number(process.env.E2E_RECORD_A_SECONDS || 6);
+const RECORD_D_SECONDS = Number(process.env.E2E_RECORD_D_SECONDS || 4);
 
 fs.rmSync(DL_DIR, { recursive: true, force: true });
 fs.mkdirSync(DL_DIR, { recursive: true });
@@ -347,12 +349,12 @@ try {
   await ui.setLowRes();   // VM 软编码 VP9 很慢，降负载防超时（不影响校验项）
 
   /* ── 场景 A：完整录制 ──────────────────────────────── */
-  console.log('\n场景 A：完整录制（倒计时 0，录 6s）');
+  console.log(`\n场景 A：完整录制（倒计时 0，录 ${RECORD_A_SECONDS}s）`);
   await ui.setCountdown(0);
   await ui.clickRec();
   await waitBgState(s => s.status === 'recording', 'recording');
   ok('进入录制态', true);
-  await sleep(6000);
+  await sleep(RECORD_A_SECONDS * 1000);
   // 捕获内容确实在流动（防「录了个寂寞」：帧/音频饥饿时立刻报出来）
   const sA = await waitBgState(s => s.fileSize > 50000, 'fileSize 增长', 25000);
   ok('录制内容持续流入（fileSize>50KB）', true, `${(sA.fileSize / 1024).toFixed(0)}KB`);
@@ -361,7 +363,10 @@ try {
   const fileA = await waitDownload([]);
   const stA = await waitBgState(s => s.status === 'idle' && !s.processing, 'idle');
   ok('停止后状态归位', stA.status === 'idle');
-  checkWebM(path.join(DL_DIR, fileA), { minMs: 4000, maxMs: 11000 });
+  checkWebM(path.join(DL_DIR, fileA), {
+    minMs: Math.max(1000, (RECORD_A_SECONDS - 2) * 1000),
+    maxMs: (RECORD_A_SECONDS + 5) * 1000,
+  });
   const hist = await popup.evaluate(() => new Promise(r =>
     chrome.storage.local.get('recordingHistory', d => r(d.recordingHistory || []))));
   ok('历史记录已写入', hist.length >= 1 && hist[0].size > 10000,
@@ -438,11 +443,14 @@ try {
     await ui.setCountdown(0);
     await ui.clickRec();
     await waitBgState(s => s.status === 'recording', 'recording');
-    await sleep(4000);
+    await sleep(RECORD_D_SECONDS * 1000);
     await ui.clickRec();
     await settleAfterStop();
     const fileD = await waitDownload([fileA, fileB, fileC].filter(Boolean));
-    checkMp4(path.join(DL_DIR, fileD), { minMs: 2500, maxMs: 9000 });
+    checkMp4(path.join(DL_DIR, fileD), {
+      minMs: Math.max(1000, (RECORD_D_SECONDS - 2) * 1000),
+      maxMs: (RECORD_D_SECONDS + 5) * 1000,
+    });
     await ui.setFormat('webm');   // 还原，避免影响后续场景
   }
 

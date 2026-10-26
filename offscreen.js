@@ -9,6 +9,8 @@
  *   3. 防静音回环：把劫持走的标签页音频接回 destination（可选）
  *   4. 倒计时（OFF_START 的 countdownSec 参数）
  *   5. onEvent：把状态/大小/历史通知回 background
+ *   6. saveFile：经 save-file.js 等待真实下载结果；OFF_RETRY_SAVE 只重试下载。
+ *      本上下文没有 UI，保存进度由 background 打开的 save-status.html 展示
  *
  * 关键点：
  *   - 跑在 offscreen document 内，popup 关闭、Chrome 最小化均不中断。

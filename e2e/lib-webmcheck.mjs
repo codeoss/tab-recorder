@@ -1,3 +1,7 @@
+/**
+ * 独立 EBML 校验器：不调用生产解析逻辑，精确验证 SeekHead 三项、
+ * 全部 Cue 的 Cluster 落点、Segment 尺寸，以及修复前后 Cluster 负载不变。
+ */
 const ID = {
   EBML: 0x1A45DFA3,
   SEGMENT: 0x18538067,

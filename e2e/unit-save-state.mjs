@@ -1,3 +1,7 @@
+/**
+ * 验证 background 下载 broker：真实完成/中断、下载进度、重复与丢弃守卫、
+ * service worker 恢复、可见保存窗口，以及上下文销毁后的不可恢复状态。
+ */
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';

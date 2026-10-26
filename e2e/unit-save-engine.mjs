@@ -1,3 +1,7 @@
+/**
+ * 用可控 saveFile Promise 驱动真实录制引擎，验证下载完成前不伪造成功、
+ * 真实文件名、失败保持忙态、重试不重复修复，以及明确丢弃后的资源释放。
+ */
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 

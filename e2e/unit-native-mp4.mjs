@@ -23,7 +23,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { topBoxes, mvhdDurationMs, readMp4Timing, mdatPayloadsEqual } from './lib-mp4check.mjs';
 
 const E2E_DIR = path.dirname(fileURLToPath(import.meta.url));
-const CHROME = process.env.CHROME_BIN || '/usr/bin/google-chrome';
+const CHROME = process.env.NATIVE_CHROME_BIN || process.env.CHROME_BIN || '/usr/bin/google-chrome';
 
 globalThis.self = globalThis;
 await import(pathToFileURL(path.resolve(E2E_DIR, '../mp4-faststart.js')).href);

@@ -1,3 +1,7 @@
+/**
+ * 验证主弹窗不会在停止后提前显示完成，并能显示真实保存阶段、
+ * 下载进度与恢复入口；保存中禁止开始，致命错误不提供假重试。
+ */
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';

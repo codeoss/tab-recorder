@@ -1,3 +1,7 @@
+/**
+ * 验证桌面 recorder 保存状态：处理中禁用控制、关窗保护、
+ * 可重试失败操作、真实下载进度和 saved 后自动关闭。
+ */
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
