@@ -8,9 +8,9 @@
  * 所以直接用品牌版 Chrome（headless）录 canvas+WebAudio。
  *
  * 验证点：
- *   1. Chrome 原生输出的 moov 确实在文件尾（确认问题前提成立）
- *   2. mp4FaststartJs 处理后 moov 移到 mdat 前、mvhd 时长合理
- *   3. 处理前后 stco/co64 偏移差值 == moov 大小，且输出可被完整重解析
+ *   1. 识别经典布局与 moov 在头的多分裂 fMP4（生产使用 start(1000)）
+ *   2. 经典布局搬迁 moov；fMP4 重建 mvhd/tkhd/mdhd 真实时长
+ *   3. fMP4 的 mdat 保持不变，经典布局的 stco/co64 偏移正确
  *
  * 运行：node e2e/unit-native-mp4.mjs
  */
@@ -20,7 +20,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { topBoxes, mvhdDurationMs } from './lib-mp4check.mjs';
+import { topBoxes, mvhdDurationMs, readMp4Timing, mdatPayloadsEqual } from './lib-mp4check.mjs';
 
 const E2E_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CHROME = process.env.CHROME_BIN || '/usr/bin/google-chrome';
@@ -67,8 +67,8 @@ const PAGE = `<!doctype html><meta charset="utf-8"><script>
   };
   window.__err = '';
   rec.onerror = e => { window.__err = String(e.error || e); };
-  rec.start();
-  setTimeout(() => rec.stop(), 2500);
+  rec.start(1000);
+  setTimeout(() => rec.stop(), 18000);
 <\/script>`;
 
 const server = http.createServer((_q, res) => {
@@ -100,7 +100,7 @@ const t0 = Date.now();
 while (!(await page.evaluate(() => window.__mp4 || null))) {
   const err = await page.evaluate(() => window.__err);
   if (err) throw new Error('MediaRecorder 错误: ' + err);
-  if (Date.now() - t0 > 15000) throw new Error('等待原生 MP4 录制超时');
+  if (Date.now() - t0 > 30000) throw new Error('等待原生 MP4 录制超时');
   await new Promise(r => setTimeout(r, 300));
 }
 const b64 = await page.evaluate(() => window.__mp4.split(',')[1]);
@@ -123,18 +123,26 @@ const moovAtEnd = moovI > mdatI && mdatI >= 0;
 console.log('  原始布局:', moovAtEnd ? 'moov 在尾（旧版 Chrome 经典布局）'
                                   : 'moov 在头（新版 Chrome 分片 MP4）', `— ${origOrder}`);
 
-// 2. JS faststart
+// 2. JS faststart + fMP4 时长修补
 const fixed = Buffer.from(await (await mp4FaststartJs(new Blob([orig]))).arrayBuffer());
 fs.writeFileSync(path.join(E2E_DIR, 'downloads', 'native-faststart.mp4'), fixed);
 const fixBoxes = topBoxes(fixed);
 ok('处理后 moov 在 mdat 之前', fixBoxes.findIndex(x => x.type === 'moov') < fixBoxes.findIndex(x => x.type === 'mdat'),
    fixBoxes.map(x => x.type).join(','));
 ok('总大小不变', fixed.length === orig.length);
-if (!moovAtEnd) ok('已是 faststart：逐字节未改动', fixed.equals(orig));
+if (!moovAtEnd) {
+  ok('真实产物包含多个 moof', origBoxes.filter(x => x.type === 'moof').length >= 2,
+     `moof=${origBoxes.filter(x => x.type === 'moof').length}`);
+  ok('fMP4 的 mdat 负载不变', mdatPayloadsEqual(orig, fixed));
+  const timing = readMp4Timing(fixed);
+  ok('fMP4 各轨道时长均非零', timing.tracks.length > 0 &&
+     timing.tracks.every(x => x.tkhdDuration > 0 && x.mdhdDuration > 0),
+     JSON.stringify(timing.tracks));
+}
 
-// 3. mvhd 时长合理（录了 2.5s）
+// 3. mvhd 时长合理（录了 18s）
 const durMs = mvhdDurationMs(fixed);
-ok('mvhd 时长合理', durMs !== null && durMs >= 1500 && durMs <= 6000,
+ok('mvhd 时长合理', durMs !== null && durMs >= 15000 && durMs <= 25000,
    durMs === null ? '无 mvhd' : `实际 ${Math.round(durMs)}ms`);
 
 // 4. chunk 偏移一致性：处理后 stco/co64 指向仍在文件内且比原始值大 moov.size

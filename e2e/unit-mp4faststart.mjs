@@ -14,6 +14,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readMp4Timing, mdatPayloadsEqual } from './lib-mp4check.mjs';
 
 globalThis.self = globalThis;   // mp4-faststart.js 是经典脚本（IIFE on self）
 await import(pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../mp4-faststart.js')).href);
@@ -81,7 +82,9 @@ function makeMp4({ is64 = false, moovFirst = false, payloadSize = 100, entries =
 /* ── 辅助解析（验证用）───────────────────────────────── */
 
 function topBoxes(buf) {
-  const dv = new DataView(buf);
+  const dv = ArrayBuffer.isView(buf)
+    ? new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
+    : new DataView(buf);
   const out = [];
   let pos = 0;
   while (pos + 8 <= buf.byteLength) {
@@ -224,6 +227,124 @@ console.log('mp4-faststart 单元测试');
      `${entries && entries[0]} vs ${e1 + M}`);
   ok('多 mdat: 第二 mdat 的 chunk 偏移不变', entries && entries[1] === e2,
      `${entries && entries[1]} vs ${e2}`);
+}
+
+function u32(v) { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v); return b; }
+function u64(v) { return cat(u32(Math.floor(v / 4294967296)), u32(v >>> 0)); }
+
+function timingBox(type, version, timescale, duration) {
+  return box(type, version === 1
+    ? cat(u32(0x01000000), u64(0), u64(0), u32(timescale), u64(duration))
+    : cat(u32(0), u32(0), u32(0), u32(timescale), u32(duration)));
+}
+function tkhdBox(version, trackId, duration) {
+  return box('tkhd', version === 1
+    ? cat(u32(0x01000000), u64(0), u64(0), u32(trackId), u32(0), u64(duration))
+    : cat(u32(0), u32(0), u32(0), u32(trackId), u32(0), u32(duration)));
+}
+function trexBox(trackId, duration) {
+  return box('trex', cat(u32(0), u32(trackId), u32(1), u32(duration), u32(0), u32(0)));
+}
+function tfhdBox(trackId, defaultDuration) {
+  return box('tfhd', defaultDuration
+    ? cat(u32(0x000008), u32(trackId), u32(defaultDuration))
+    : cat(u32(0), u32(trackId)));
+}
+function tfdtBox(version, baseTime) {
+  return box('tfdt', version === 1 ? cat(u32(0x01000000), u64(baseTime)) : cat(u32(0), u32(baseTime)));
+}
+function trunBox(entries) {
+  const hasDuration = entries.every(e => e[0] !== null);
+  const hasCts = entries.some(e => e[1] !== null);
+  const flags = (hasDuration ? 0x100 : 0) | (hasCts ? 0x800 : 0);
+  const rows = entries.map(([duration, cts]) => cat(
+    hasDuration ? u32(duration) : new Uint8Array(0),
+    hasCts ? u32(cts || 0) : new Uint8Array(0),
+  ));
+  return box('trun', cat(u32(flags), u32(entries.length), ...rows));
+}
+function trafBox(version, trackId, baseTime, truns, defaultDuration = 0) {
+  return box('traf', cat(
+    tfhdBox(trackId, defaultDuration),
+    tfdtBox(version, baseTime),
+    ...truns.map(trunBox),
+  ));
+}
+function makeFragmentedMp4(version) {
+  const videoTrack = box('trak', cat(
+    tkhdBox(version, 1, 0),
+    box('mdia', timingBox('mdhd', version, 30000, 0)),
+  ));
+  const audioTrack = box('trak', cat(
+    tkhdBox(version, 2, 0),
+    box('mdia', timingBox('mdhd', version, 48000, 0)),
+  ));
+  const moov = box('moov', cat(
+    timingBox('mvhd', version, 1000, 0),
+    videoTrack,
+    audioTrack,
+    box('mvex', cat(trexBox(1, 900), trexBox(2, 1920))),
+  ));
+  const fragments = [
+    [
+      trafBox(version, 1, 0, [
+        [[900, 0], [900, 300]],
+        [[900, 0]],
+      ]),
+      trafBox(version, 2, 0, [[[1920, null], [1920, null]]]),
+    ],
+    [
+      trafBox(version, 1, 2700, [[[null, null], [null, null]]], 900),
+      trafBox(version, 2, 3840, [[[null, null], [null, null]]]),
+    ],
+    [
+      trafBox(version, 1, 5400, [[[null, null], [null, 300]]]),
+      trafBox(version, 2, 7680, [[[960, null], [960, null], [960, null]]]),
+    ],
+  ];
+  const parts = [box('ftyp', new Uint8Array(16)), moov];
+  fragments.forEach((trafs, i) => {
+    parts.push(box('moof', cat(box('mfhd', cat(u32(0), u32(i + 1))), ...trafs)));
+    parts.push(box('mdat', new Uint8Array(16 + i).fill(i + 1)));
+  });
+  parts.push(box('mfra', new Uint8Array(4)));
+  return cat(...parts);
+}
+
+for (const version of [0, 1]) {
+  const bytes = makeFragmentedMp4(version);
+  const out = Buffer.from(await (await mp4FaststartJs(new Blob([bytes]))).arrayBuffer());
+  const timing = readMp4Timing(out);
+  ok(`fMP4 v${version}: mvhd=250ms`, timing.movie.timescale === 1000 && timing.movie.duration === 250,
+     JSON.stringify(timing.movie));
+  ok(`fMP4 v${version}: 视频轨道时长`, timing.tracks[0].trackId === 1 &&
+     timing.tracks[0].tkhdDuration === 250 && timing.tracks[0].mdhdTimescale === 30000 &&
+     timing.tracks[0].mdhdDuration === 7500, JSON.stringify(timing.tracks[0]));
+  ok(`fMP4 v${version}: 音频轨道时长`, timing.tracks[1].trackId === 2 &&
+     timing.tracks[1].tkhdDuration === 220 && timing.tracks[1].mdhdTimescale === 48000 &&
+     timing.tracks[1].mdhdDuration === 10560, JSON.stringify(timing.tracks[1]));
+  const outBoxes = topBoxes(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+  ok(`fMP4 v${version}: 总大小与 box 布局不变`, out.length === bytes.length &&
+     outBoxes.map(x => x.type).join(',') === topBoxes(bytes).map(x => x.type).join(','));
+  ok(`fMP4 v${version}: mdat 负载不变`, mdatPayloadsEqual(Buffer.from(bytes), out));
+  const originalBoxes = topBoxes(bytes);
+  ok(`fMP4 v${version}: moof/mfra 内容不变`, ['moof', 'mfra'].every(type =>
+    originalBoxes.filter(x => x.type === type).every(box =>
+      out.subarray(box.off, box.off + box.size).equals(Buffer.from(bytes).subarray(box.off, box.off + box.size)))));
+}
+
+{
+  const bytes = makeFragmentedMp4(1);
+  const firstMoof = topBoxes(bytes).find(x => x.type === 'moof');
+  const badMoof = new Uint8Array(100);
+  new DataView(badMoof.buffer).setUint32(0, 100);
+  badMoof.set([109, 111, 111, 102], 4);
+  new DataView(badMoof.buffer).setUint32(8, 1000);
+  badMoof.set([116, 114, 97, 102], 12);
+  const broken = cat(bytes.subarray(0, firstMoof.off), badMoof, box('mdat', new Uint8Array(4)));
+  let threw = false;
+  try { await mp4FaststartJs(new Blob([broken])); } catch (_) { threw = true; }
+  ok('截断 moof: 抛错回退', threw);
 }
 
 console.log(failed === 0 ? '单元测试全部通过 🎉' : `${failed} 项失败 ❌`);

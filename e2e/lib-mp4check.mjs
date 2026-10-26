@@ -46,6 +46,53 @@ export function mvhdDurationMs(b) {
   return timescale ? duration / timescale * 1000 : null;
 }
 
+export function readMp4Timing(b) {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  function find(tag, start) { return b.indexOf(Buffer.from(tag), start); }
+  function duration(dataStart, version, v0, v1) {
+    if (version === 1) {
+      return dv.getUint32(dataStart + v1) * 4294967296 + dv.getUint32(dataStart + v1 + 4);
+    }
+    return dv.getUint32(dataStart + v0);
+  }
+  const mv = find('mvhd', 0);
+  if (mv < 0) return null;
+  const mvData = mv + 4;
+  const mvVersion = b[mvData];
+  const movie = {
+    timescale: dv.getUint32(mvData + (mvVersion === 1 ? 20 : 12)),
+    duration: duration(mvData, mvVersion, 16, 24),
+  };
+  const tracks = [];
+  let cursor = mvData + 4;
+  for (;;) {
+    const tk = find('tkhd', cursor);
+    if (tk < 0) break;
+    const md = find('mdhd', tk + 4);
+    if (md < 0) break;
+    const tkData = tk + 4;
+    const mdData = md + 4;
+    const tkVersion = b[tkData];
+    const mdVersion = b[mdData];
+    tracks.push({
+      trackId: dv.getUint32(tkData + (tkVersion === 1 ? 20 : 12)),
+      tkhdDuration: duration(tkData, tkVersion, 20, 28),
+      mdhdTimescale: dv.getUint32(mdData + (mdVersion === 1 ? 20 : 12)),
+      mdhdDuration: duration(mdData, mdVersion, 16, 24),
+    });
+    cursor = mdData + 4;
+  }
+  return { movie, tracks };
+}
+
+export function mdatPayloadsEqual(a, b) {
+  const payload = x => topBoxes(x).filter(box => box.type === 'mdat')
+    .map(box => x.subarray(box.off + box.headerLen, box.off + box.size));
+  const aa = payload(a);
+  const bb = payload(b);
+  return aa.length === bb.length && aa.every((buf, i) => buf.equals(bb[i]));
+}
+
 export function makeCheckMp4(ok) {
   return function checkMp4(file, { minMs = 0, maxMs = Infinity } = {}) {
     const b = fs.readFileSync(file);
