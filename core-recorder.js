@@ -123,8 +123,13 @@
       if (paused_ && pauseTs) { pausedMs += Date.now() - pauseTs; paused_ = false; }
       if (stopTimer)  { clearTimeout(stopTimer);  stopTimer = null; }
       if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
-      if (recorder && recorder.state !== 'inactive') recorder.stop();
-      else releaseAll();
+      if (recorder && recorder.state !== 'inactive') {
+        if (!isProcessing) {
+          isProcessing = true;
+          emit('processing', { active: true, stage: recordedIsMp4 ? 'mp4-fix' : 'webm-fix' });
+        }
+        recorder.stop();
+      } else releaseAll();
     }
 
     function pause() {

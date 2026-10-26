@@ -11,7 +11,7 @@
   for (const id of ['title', 'detail', 'progressText', 'progress', 'retryBtn', 'discardBtn', 'closeBtn']) {
     el[id] = document.getElementById(id);
   }
-  let unsaved = false;
+  let unsaved = true;
   let completeTimer = null;
 
   function mb(bytes) { return ((bytes || 0) / 1048576).toFixed(1); }

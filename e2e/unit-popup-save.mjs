@@ -28,7 +28,7 @@ function element() {
   };
 }
 
-function popupWith(bg) {
+function popupWith(bg, responses = {}) {
   const elements = new Map();
   const scheduled = [];
   const context = {
@@ -42,7 +42,8 @@ function popupWith(bg) {
       addEventListener() {},
     },
     chrome: {
-      runtime: { sendMessage: async msg => msg.type === 'GET_STATE' ? { ...bg } : { ok: 1 } },
+      runtime: { sendMessage: async msg => msg.type === 'GET_STATE'
+        ? { ...bg } : { ok: 1, ...responses[msg.type] } },
       storage: { local: {
         get: (_key, cb) => cb({}),
         set: () => {},
@@ -56,7 +57,7 @@ function popupWith(bg) {
     Date,
   };
   const source = fs.readFileSync(path.join(ROOT, 'popup.js'), 'utf8').replace(/\r\n/g, '\n') +
-    '\nglobalThis.__popupTest = { stop, pollState, el };\n';
+    '\nglobalThis.__popupTest = { stop, discard, pollState, el };\n';
   vm.runInNewContext(source, context, { filename: 'popup.js' });
   return { test: context.__popupTest, scheduled };
 }
@@ -92,6 +93,18 @@ function popupWith(bg) {
   await test.pollState();
   ok('不可恢复错误不提供重试且允许新录制', test.el.retrySaveBtn && test.el.retrySaveBtn.hidden !== false &&
      test.el.rec.style.pointerEvents !== 'none' && test.el.saveText && test.el.saveText.textContent.includes('无法重试'));
+}
+
+{
+  const { test } = popupWith({
+    status: 'idle', mode: 'tab', processing: true,
+    savePhase: 'error', saveCanRetry: true, saveError: 'FILE_NO_SPACE',
+  }, { DISCARD_RECORDING: { ok: 0, error: '视频正在保存，暂不能丢弃' } });
+  await test.discard();
+  ok('丢弃失败不得显示成功或清除保存状态',
+    !test.el.stxt.textContent.includes('已丢弃') &&
+    test.el.saveText.textContent.includes('FILE_NO_SPACE') &&
+    !test.el.savePanel.classList.contains('hidden'), test.el.stxt.textContent);
 }
 
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n主弹窗保存状态测试全部通过 🎉');

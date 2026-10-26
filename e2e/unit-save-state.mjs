@@ -24,11 +24,12 @@ function harness(initialState = null) {
   const createdWindows = [];
   const focusedWindows = [];
   let nextId = 1;
+  let sendImpl = async () => ({ ok: 1 });
   const chrome = {
     runtime: {
       onMessage: { addListener: fn => { listeners.message = fn; } },
       onInstalled: { addListener: fn => { listeners.installed = fn; } },
-      sendMessage: async msg => { sent.push(msg); return { ok: 1 }; },
+      sendMessage: async msg => { sent.push(msg); return sendImpl(msg); },
       getContexts: async () => contexts,
       getURL: path => `chrome-extension://test/${path}`,
     },
@@ -96,7 +97,8 @@ function harness(initialState = null) {
     if (!items.has(id)) items.set(id, { id, state: 'in_progress', filename: '', bytesReceived: 0, totalBytes: 100 });
     Object.assign(items.get(id), values);
   }
-  return { chrome, listeners, session, local, sent, items, send, patch, contexts, createdWindows, focusedWindows };
+  return { chrome, listeners, session, local, sent, items, send, patch, contexts, createdWindows, focusedWindows,
+    respondWith: fn => { sendImpl = fn; } };
 }
 
 async function processing(h, stage = 'webm-fix') {
@@ -244,6 +246,105 @@ async function processing(h, stage = 'webm-fix') {
   const state = await h.send('GET_STATE');
   ok('RETRY_SAVE 转发到引擎并恢复保存阶段', !result.error && state.savePhase === 'processing' &&
      state.saveError === '' && h.sent.some(x => x.type === 'OFF_RETRY_SAVE'));
+}
+
+{
+  const h = harness();
+  await h.send('START_RECORDING', { source: 'tab' });
+  await h.send('STOP_RECORDING');
+  const state = await h.send('GET_STATE');
+  ok('STOP 后立即进入保存忙态', state.status === 'idle' && state.processing === true &&
+     state.savePhase === 'processing', JSON.stringify(state));
+}
+
+{
+  const h = harness({ status: 'recording', mode: 'tab' });
+  await h.send('ENGINE_PROCESSING', { active: true, stage: 'webm-fix' });
+  const state = await h.send('GET_STATE');
+  ok('自动停止转为 idle 而非继续 recording', state.status === 'idle' && state.processing === true);
+}
+
+{
+  const h = harness({
+    status: 'recording', mode: 'tab', processing: true, savePhase: 'complete', saveCanRetry: true,
+  });
+  h.contexts.length = 0;
+  const state = await h.send('GET_STATE');
+  ok('下载完成后上下文丢失仍清理忙态并转为 idle', state.status === 'idle' && state.processing === false &&
+     state.savePhase === 'error' && state.saveCanRetry === false);
+}
+
+for (const [mode, response] of [['tab', false], ['desktop', { ok: 0 }], ['desktop', null]]) {
+  const h = harness({
+    status: 'idle', mode, processing: true, savePhase: 'error', saveCanRetry: true,
+    recorderTabId: 1,
+  });
+  h.respondWith(async () => response);
+  h.chrome.tabs.sendMessage = async (...args) => { h.sent.push(args); return response; };
+  const result = await h.send('RETRY_SAVE');
+  const state = await h.send('GET_STATE');
+  ok(`重试响应 ${JSON.stringify(response)} 被识别为失败并保留可重试错误`, !result.ok &&
+     state.savePhase === 'error' && state.processing === true && state.saveCanRetry === true,
+     JSON.stringify({ result, state }));
+}
+
+{
+  const h = harness();
+  await processing(h);
+  await h.send('SAVE_FILE', { url: 'blob:chrome-extension://x/old', filename: 'old.webm' });
+  let resolveSearch;
+  h.chrome.downloads.search = () => new Promise(resolve => {
+    resolveSearch = () => resolve([{
+      id: 1, state: 'complete', filename: 'C:/Downloads/old.webm', bytesReceived: 100, totalBytes: 100,
+    }]);
+  });
+  const pending = h.send('GET_DOWNLOAD_STATUS', { downloadId: 1 });
+  await h.send('ENGINE_SAVE_ERROR', { message: 'FILE_NO_SPACE', canRetry: true });
+  await h.send('RETRY_SAVE');
+  await h.send('SAVE_FILE', { url: 'blob:chrome-extension://x/new', filename: 'new.webm' });
+  resolveSearch();
+  const result = await pending;
+  const state = await h.send('GET_STATE');
+  ok('旧下载完成事件不得覆盖新任务', !!result.error && state.downloadId === 2 &&
+     state.savePhase === 'downloading' && state.saveFilename === 'new.webm',
+     JSON.stringify({ result, state }));
+}
+
+{
+  const h = harness({ status: 'idle', mode: 'tab' });
+  await Promise.all([
+    h.send('ENGINE_PROCESSING', { active: true, stage: 'webm-fix' }),
+    h.send('ENGINE_PROCESSING', { active: true, stage: 'webm-fix' }),
+  ]);
+  ok('并发处理事件只创建一个保存窗口', h.createdWindows.length === 1,
+     `实际 ${h.createdWindows.length}`);
+}
+
+{
+  const h = harness();
+  await processing(h);
+  const download = h.chrome.downloads.download.bind(h.chrome.downloads);
+  let releaseOld;
+  let markOldStarted;
+  const oldStarted = new Promise(resolve => { markOldStarted = resolve; });
+  h.chrome.downloads.download = async options => {
+    if (options.filename !== 'old.webm') return download(options);
+    markOldStarted();
+    const id = await download(options);
+    await new Promise(resolve => { releaseOld = resolve; });
+    return id;
+  };
+  const pending = h.send('SAVE_FILE', { url: 'blob:chrome-extension://x/old', filename: 'old.webm' });
+  await oldStarted;
+  await h.send('ENGINE_SAVE_ERROR', { message: 'FILE_NO_SPACE', canRetry: true });
+  await h.send('RETRY_SAVE');
+  await h.send('SAVE_FILE', { url: 'blob:chrome-extension://x/new', filename: 'new.webm' });
+  releaseOld();
+  const result = await pending;
+  const state = await h.send('GET_STATE');
+  ok('迟到的下载创建结果不得覆盖重试任务', !!result.error && state.downloadId === 2 &&
+     state.saveFilename === 'new.webm' && state.saveGeneration > 0,
+     JSON.stringify({ result, state }));
 }
 
 {

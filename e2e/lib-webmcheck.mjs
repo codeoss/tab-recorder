@@ -172,7 +172,7 @@ export function checkWebMSeekStructure(b) {
       if (cueTimes[i] < cueTimes[i - 1]) errors.push('CueTime 非单调');
     }
   }
-  return { errors, cueTimes, segmentUnknown: segment.unknown };
+  return { errors, cueTimes, segmentUnknown: segment.unknown, info };
 }
 
 export function webMClustersEqual(input, output) {

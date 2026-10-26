@@ -147,6 +147,9 @@ async function golden(name, bytes, durationMs) {
   if (Buffer.from(bytes).includes(Buffer.from([0x1F, 0x43, 0xB6, 0x75]))) {
     const report = checkWebMSeekStructure(legacy);
     ok(`${name}：SeekHead/Cue 定位`, report.errors.length === 0, report.errors.join('；'));
+    ok(`${name}：真实 Info 位置不被 SeekID 干扰`,
+      report.info && report.info.off !== legacy.indexOf(Buffer.from(INFO)) &&
+      legacy.subarray(report.info.off, report.info.off + 4).equals(Buffer.from(INFO)));
     ok(`${name}：Cluster 负载不变`, webMClustersEqual(Buffer.from(bytes), legacy));
   }
   return legacy;
@@ -229,6 +232,39 @@ await golden('TimecodeScale=500000',
 /* 10. 单 Cluster 大负载（200KB）+ 64KB 窗口 → 大元素按 size 跳过，不读内部 */
 await golden('200KB 负载 Cluster',
   wrapDefinite([info({}), tracks, cluster(0, 200 * 1024)]), 4000);
+
+/* 10b. unknown Segment + Duration 插入 + Info 加宽 + SeekHead 同时发生 */
+{
+  const bytes = wrapUnknown([info({ voidPad: 111 }), tracks, cluster(0), cluster(600)]);
+  const legacy = await golden('组合：unknown Segment+Info加宽+插入Duration', bytes, 1200);
+  const report = checkWebMSeekStructure(legacy);
+  ok('  · 组合位移后 Seek/Cue 仍准确且 Info 已加宽',
+    report.segmentUnknown && report.errors.length === 0 &&
+    report.info.dataOff - report.info.off === 6 &&
+    legacy.subarray(report.info.dataOff, report.info.end).includes(Buffer.from([0x44, 0x89, 0x88])),
+    report.errors.join('；'));
+}
+
+/* 10c. 记录实际物化的读取范围：滑窗有界，不能因修复再整文件扫描一遍 */
+{
+  const bytes = wrapDefinite([info({}), tracks, cluster(0, 200 * 1024), cluster(1000)]);
+  const source = new Blob([bytes]);
+  const reads = [];
+  const readAll = source.arrayBuffer.bind(source);
+  source.arrayBuffer = async () => { reads.push([0, source.size]); return readAll(); };
+  const slice = source.slice.bind(source);
+  source.slice = (start = 0, end = source.size) => {
+    const part = slice(start, end);
+    const readPart = part.arrayBuffer.bind(part);
+    part.arrayBuffer = async () => { reads.push([start, end]); return readPart(); };
+    return part;
+  };
+  await _fixWebMStream(source, 4000, 65536);
+  ok('WebM 单次读取不超过滑窗', reads.every(([start, end]) => end - start <= 65536),
+    JSON.stringify(reads));
+  ok('WebM 不新增第二次全文件扫描', reads.reduce((sum, [start, end]) => sum + end - start, 0) <=
+    bytes.length + 2 * 65536, JSON.stringify(reads));
+}
 
 /* 11. 公开 API 路由：fixWebMBlob 走流式并与直接调用等价 */
 {

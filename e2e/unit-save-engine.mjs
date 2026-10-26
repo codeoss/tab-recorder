@@ -73,6 +73,7 @@ function successEvents(events) {
   });
   await engine.start({ outputFormat: 'webm' });
   engine.stop();
+  ok('stop 同步进入 busy（onstop 尚未到达）', engine.isBusy());
   await waitFor(() => calls.length === 1 || events.some(x =>
     x.name === 'saved' || x.name === 'stopped' || x.name === 'saveerror'));
   ok('下载未决时不发 saved/stopped/processing=false',

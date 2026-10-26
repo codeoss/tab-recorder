@@ -52,6 +52,15 @@ if (!fs.existsSync(SCRIPT)) {
   }
   const flush = async () => { await new Promise(resolve => setImmediate(resolve)); };
 
+  const initial = page({ processing: false, savePhase: '', saveCanRetry: false });
+  const initialEvent = { preventDefault() {}, returnValue: '' };
+  initial.listeners.beforeunload?.(initialEvent);
+  ok('首次状态查询返回前不解除关窗保护', !!initialEvent.returnValue);
+  await flush();
+  const noTaskEvent = { preventDefault() {}, returnValue: '' };
+  initial.listeners.beforeunload?.(noTaskEvent);
+  ok('明确无保存任务后才允许直接关窗', !noTaskEvent.returnValue);
+
   const processing = page({ processing: true, savePhase: 'processing', processingStage: 'webm-fix', saveCanRetry: true });
   await flush();
   ok('整理阶段显示明确保存警告', processing.elements.title.textContent.includes('保存') &&

@@ -229,7 +229,7 @@
       decodeTime += duration;
       safeInteger(decodeTime);
     }
-    return maxEnd;
+    return { maxEnd, decodeTime };
   }
 
   function parseMoof(dv, meta, ends) {
@@ -244,9 +244,11 @@
       if (!meta.tracks.has(trackId)) throw new Error('MP4 分片包含未知轨道');
       const baseTime = parseTfdt(dv, tfdt);
       const fallback = defaultDuration || meta.defaults.get(trackId) || 0;
+      let decodeTime = baseTime;
       for (const trun of children.filter(x => x.type === 'trun')) {
-        const end = parseTrun(dv, trun, baseTime, fallback);
-        ends.set(trackId, Math.max(ends.get(trackId) || 0, end));
+        const result = parseTrun(dv, trun, decodeTime, fallback);
+        decodeTime = result.decodeTime;
+        ends.set(trackId, Math.max(ends.get(trackId) || 0, result.maxEnd));
       }
     }
   }

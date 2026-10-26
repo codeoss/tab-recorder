@@ -225,7 +225,16 @@ async function togglePause() {
 
 async function discard() {
   if (!confirm('确定丢弃此次录制？')) return;
-  try { await send('DISCARD_RECORDING'); } catch (_) {}
+  let result;
+  try { result = await send('DISCARD_RECORDING'); }
+  catch (error) { result = { error: error.message }; }
+  if (!result || result.error || result.ok === 0) {
+    let bg = null;
+    try { bg = await send('GET_STATE'); } catch (_) {}
+    renderSaveState(bg || { processing: true, savePhase: 'processing' });
+    status('pau', result?.error || '丢弃失败，请查看保存状态');
+    return;
+  }
   state = 'idle'; stopTick();
   el.timer.textContent = '00:00:00';
   el.size.textContent = '';

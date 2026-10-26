@@ -85,7 +85,7 @@ patch('core-recorder.js', `      recorder.onstop = () => onStopped();`,
       recorder.onstop = () => { ${RELAY(`'recorder.onstop'`)} onStopped(); };`);
 patch('core-recorder.js', `          if (recorder && recorder.state !== 'inactive') stop();`,
   RELAY(`'track ended:'+t.kind+' rstate='+(recorder&&recorder.state)`) + '\n', { prepend: true });
-patch('core-recorder.js', `      if (recorder && recorder.state !== 'inactive') recorder.stop();`,
+patch('core-recorder.js', `        recorder.stop();`,
   RELAY(`'engine.stop state='+(recorder&&recorder.state)`) + '\n', { prepend: true });
 patch('core-recorder.js', `      releaseAll(); stopTick();\n      isProcessing = true;`,
   RELAY(`'onStopped enter chunks='+chunks.length`) + '\n', { prepend: true });
@@ -201,22 +201,17 @@ function checkWebM(file, { minMs = 0, maxMs = Infinity } = {}) {
   const seek = checkWebMSeekStructure(b);
   ok('SeekHead 三项与全部 Cue 精确定位', seek.errors.length === 0, seek.errors.join('；'));
   ok('含 Opus 音频轨', b.includes(Buffer.from('A_OPUS')));
-  // Duration 元素(0x4489) 必须在 Info(0x1549A966) 段的数据范围内找——
-  // 裸搜全文会被视频负载/Tracks 里的相同字节误中（实测踩坑两次）
-  const infoAt = b.indexOf(Buffer.from([0x15, 0x49, 0xa9, 0x66]));
+  // 只扫独立校验器定位的真实 Info 子元素，不能裸搜 SeekID 或媒体负载。
+  const info = seek.info;
   let i = -1;
-  if (infoAt >= 0) {
-    const sb = b[infoAt + 4];
-    let lenBytes = 0, infoSize = 0;
-    if (sb & 0x80) { lenBytes = 1; infoSize = sb & 0x7f; }
-    else if (sb & 0x40) { lenBytes = 2; infoSize = sb & 0x3f; }
-    else if (sb & 0x20) { lenBytes = 3; infoSize = sb & 0x1f; }
-    else if (sb & 0x10) { lenBytes = 4; infoSize = sb & 0x0f; }
-    if (lenBytes > 0) {
-      for (let j = 1; j < lenBytes; j++) infoSize = infoSize * 256 + b[infoAt + 4 + j];
-      const dataStart = infoAt + 4 + lenBytes;
-      const hit = b.subarray(dataStart, dataStart + infoSize).indexOf(Buffer.from([0x44, 0x89]));
-      if (hit >= 0) i = dataStart + hit;
+  if (info) {
+    let pos = info.dataOff;
+    while (pos + 3 <= info.end) {
+      if (b[pos] === 0x44 && b[pos + 1] === 0x89 && (b[pos + 2] === 0x88 || b[pos + 2] === 0x84)) {
+        i = pos;
+        break;
+      }
+      pos++;
     }
   }
   if (i < 0) {

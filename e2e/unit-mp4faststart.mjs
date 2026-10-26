@@ -335,6 +335,44 @@ for (const version of [0, 1]) {
 
 {
   const bytes = makeFragmentedMp4(1);
+  const source = new Blob([bytes]);
+  const reads = [];
+  const readAll = source.arrayBuffer.bind(source);
+  source.arrayBuffer = async () => { reads.push([0, source.size]); return readAll(); };
+  const slice = source.slice.bind(source);
+  source.slice = (start = 0, end = source.size) => {
+    const part = slice(start, end);
+    const readPart = part.arrayBuffer.bind(part);
+    part.arrayBuffer = async () => { reads.push([start, end]); return readPart(); };
+    return part;
+  };
+  await mp4FaststartJs(source);
+  const media = topBoxes(bytes).filter(x => x.type === 'mdat');
+  ok('fMP4 只读 mdat 头部（最多16字节），不整段读取', reads.every(([start, end]) =>
+    media.every(x => end <= x.off + 16 || start >= x.off + x.size)), JSON.stringify(reads));
+  ok('fMP4 不整文件物化', reads.every(([start, end]) => end - start < bytes.length));
+}
+
+{
+  const moov = box('moov', cat(
+    timingBox('mvhd', 1, 1000, 0),
+    box('trak', cat(tkhdBox(1, 1, 0), box('mdia', timingBox('mdhd', 1, 1000, 0)))),
+    box('mvex', trexBox(1, 100)),
+  ));
+  const moof = box('moof', trafBox(1, 1, 1000, [
+    [[100, null], [100, null]],
+    [[100, null], [100, null]],
+  ]));
+  const bytes = cat(box('ftyp', new Uint8Array(16)), moov, moof, box('mdat', new Uint8Array(8)));
+  const out = Buffer.from(await (await mp4FaststartJs(new Blob([bytes]))).arrayBuffer());
+  const timing = readMp4Timing(out);
+  ok('同一 traf 多个 trun 共享解码时间线', timing.movie.duration === 1400 &&
+     timing.tracks[0].mdhdDuration === 1400 && timing.tracks[0].tkhdDuration === 1400,
+     `实际 ${timing.movie.duration}，预期 1400`);
+}
+
+{
+  const bytes = makeFragmentedMp4(1);
   const firstMoof = topBoxes(bytes).find(x => x.type === 'moof');
   const badMoof = new Uint8Array(100);
   new DataView(badMoof.buffer).setUint32(0, 100);

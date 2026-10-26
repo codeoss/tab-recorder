@@ -37,6 +37,7 @@ const state = {
   saveCanRetry: false,
   saveReceived: 0,
   saveTotal: 0,
+  saveGeneration: 0,        // 新录制/重试递增，防止旧异步结果提交到新任务
 };
 
 /* ═══════════════════════════════════════════════════════
@@ -83,7 +84,11 @@ function downloadBasename(path) {
 
 async function refreshDownloadStatus(downloadId) {
   if (!downloadId || downloadId !== state.downloadId) return { error: '下载任务不存在或已过期' };
+  const generation = state.saveGeneration;
   const [item] = await chrome.downloads.search({ id: downloadId });
+  if (generation !== state.saveGeneration || downloadId !== state.downloadId) {
+    return { error: '下载任务已替换，忽略过期结果' };
+  }
   if (!item) {
     setState({ savePhase: 'error', saveError: 'DOWNLOAD_NOT_FOUND' });
     return { state: 'interrupted', error: 'DOWNLOAD_NOT_FOUND', filename: state.saveFilename, path: '', received: 0, total: 0 };
@@ -142,6 +147,7 @@ async function ensureOffscreen() {
 
 function markSaveContextLost(message) {
   setState({
+    status: 'idle',
     processing: false,
     savePhase: 'error',
     processingStage: '',
@@ -151,27 +157,40 @@ function markSaveContextLost(message) {
   badge('error');
 }
 
+let saveWindowPromise = null;
+
 async function openSaveWindow() {
-  if (state.saveWindowId) {
-    try {
-      await chrome.windows.update(state.saveWindowId, { focused: true });
-      return state.saveWindowId;
-    } catch (_) {
-      setState({ saveWindowId: 0 });
+  if (saveWindowPromise) return await saveWindowPromise;
+  const pending = (async () => {
+    if (state.saveWindowId) {
+      try {
+        await chrome.windows.update(state.saveWindowId, { focused: true });
+        return state.saveWindowId;
+      } catch (_) {
+        setState({ saveWindowId: 0 });
+      }
     }
+    const win = await chrome.windows.create({
+      url: chrome.runtime.getURL('save-status.html'),
+      type: 'popup', width: 420, height: 360, focused: true,
+    });
+    setState({ saveWindowId: win.id });
+    return win.id;
+  })();
+  saveWindowPromise = pending;
+  try {
+    return await pending;
+  } finally {
+    if (saveWindowPromise === pending) saveWindowPromise = null;
   }
-  const win = await chrome.windows.create({
-    url: chrome.runtime.getURL('save-status.html'),
-    type: 'popup', width: 420, height: 360, focused: true,
-  });
-  setState({ saveWindowId: win.id });
-  return win.id;
 }
 
 async function reconcileEngineContext() {
-  if (!state.processing || state.savePhase === 'complete' || state.mode !== 'tab') return;
+  if (!state.processing || state.mode !== 'tab') return;
   if (!chrome.runtime.getContexts) return;
+  const generation = state.saveGeneration;
   const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (generation !== state.saveGeneration) return;
   if (!contexts.length) markSaveContextLost('录制上下文已关闭，无法继续保存');
 }
 
@@ -183,7 +202,7 @@ chrome.windows.onRemoved.addListener(async windowId => {
   }
   if (windowId && windowId === state.recorderWindowId && state.recorderWindowId !== 0) {
     setState({ recorderWindowId: 0, recorderTabId: 0 });
-    if (state.processing && state.savePhase !== 'complete') {
+    if (state.processing) {
       markSaveContextLost('录制窗口已关闭，无法继续保存');
     } else if (state.status !== 'idle') {
       setState({ status: 'idle' });
@@ -213,6 +232,7 @@ async function route(msg) {
         return { error: '已有录制进行中或仍在保存，请先停止' };
       }
       resetSaveResult();
+      setState({ saveGeneration: state.saveGeneration + 1 });
       if (msg.source === 'tab' && !msg.compatMode) return await startTabRecording(msg);
       if (msg.source === 'tab' && msg.compatMode)  return await startCompatTabRecording(msg);
       return await startDesktopRecording(msg);
@@ -220,10 +240,17 @@ async function route(msg) {
 
     /* ── 停止录制 ─────────────────────────────────────── */
     case 'STOP_RECORDING': {
+      const finalizing = state.status === 'recording' || state.status === 'paused';
       // 发停止指令让引擎跑完 onStopped（保存文件）；
       // desktop 模式引擎保存完会自己关窗口，无需在这里直接 remove
       await sendToRecorderEngine('OFF_STOP');
-      setState({ status: 'idle' }); badge('idle');
+      if (finalizing) {
+        setState({ status: 'idle', processing: true, savePhase: 'processing', processingStage: 'finalizing' });
+        badge('saving');
+      } else {
+        setState({ status: 'idle' });
+        badge('idle');
+      }
       return { ok: 1 };
     }
 
@@ -270,13 +297,23 @@ async function route(msg) {
       if (state.savePhase !== 'error' || !state.saveCanRetry) {
         return { error: '当前没有可重试的保存任务' };
       }
+      const generation = state.saveGeneration + 1;
       setState({
         processing: true, savePhase: 'processing', processingStage: 'download',
         downloadId: 0, saveError: '', saveReceived: 0, saveTotal: 0,
+        saveGeneration: generation,
       });
       badge('saving');
       const result = await sendToRecorderEngine('OFF_RETRY_SAVE');
-      return { ok: result === false ? 0 : 1 };
+      if (generation !== state.saveGeneration) return { error: '保存任务已替换，忽略过期结果' };
+      if (result === true || result?.ok === 1) return { ok: 1 };
+      const message = result?.error || '重试请求未送达或保存尚未完成，请保持录制上下文打开后重试';
+      setState({
+        status: 'idle', processing: true, savePhase: 'error', processingStage: '',
+        saveError: message, saveCanRetry: true,
+      });
+      badge('error');
+      return { error: message };
     }
 
     case 'SAVE_FILE': {
@@ -287,12 +324,16 @@ async function route(msg) {
       if (typeof msg.url !== 'string' || !msg.url.startsWith('blob:') || !msg.filename) {
         return { error: '保存参数无效' };
       }
+      const generation = state.saveGeneration;
       const downloadId = await chrome.downloads.download({
         url: msg.url,
         filename: msg.filename,
         conflictAction: 'uniquify',
         saveAs: false,
       });
+      if (generation !== state.saveGeneration) {
+        return { error: '保存任务已替换，忽略过期下载' };
+      }
       setState({
         savePhase: 'downloading', processingStage: 'download', downloadId,
         saveError: '', saveFilename: msg.filename, saveCanRetry: true,
@@ -332,6 +373,7 @@ async function route(msg) {
     case 'ENGINE_SAVE_ERROR': {
       const canRetry = msg.canRetry !== false;
       setState({
+        status: 'idle',
         processing: canRetry,
         savePhase: 'error',
         processingStage: '',
@@ -365,6 +407,7 @@ async function route(msg) {
     case 'ENGINE_PROCESSING':   // 引擎进入/离开保存链（fixWebM/转码/下载）
       if (msg.active) {
         setState({
+          status: 'idle',
           processing: true,
           savePhase: msg.stage === 'download' ? 'downloading' : 'processing',
           processingStage: msg.stage || '',
