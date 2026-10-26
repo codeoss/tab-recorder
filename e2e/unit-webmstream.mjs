@@ -21,6 +21,7 @@
 
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { checkWebMSeekStructure, webMClustersEqual } from './lib-webmcheck.mjs';
 
 globalThis.self = globalThis;   // fix-webm.js 是经典脚本（IIFE on self）
 await import(pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fix-webm.js')).href);
@@ -142,6 +143,11 @@ async function golden(name, bytes, durationMs) {
     ok(`golden 逐字节一致 [WIN=${w}]`, eq,
       eq ? '' : `首个差异 @${firstDiff(streamed, legacy)}（len ${streamed.length} vs ${legacy.length}）`);
     if (!eq) break;   // 已失败，无需再试更大窗口
+  }
+  if (Buffer.from(bytes).includes(Buffer.from([0x1F, 0x43, 0xB6, 0x75]))) {
+    const report = checkWebMSeekStructure(legacy);
+    ok(`${name}：SeekHead/Cue 定位`, report.errors.length === 0, report.errors.join('；'));
+    ok(`${name}：Cluster 负载不变`, webMClustersEqual(Buffer.from(bytes), legacy));
   }
   return legacy;
 }

@@ -24,6 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeCheckMp4 } from './lib-mp4check.mjs';
+import { checkWebMSeekStructure } from './lib-webmcheck.mjs';
 
 const E2E_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(E2E_DIR, '..');
@@ -175,6 +176,8 @@ function checkWebM(file, { minMs = 0, maxMs = Infinity } = {}) {
   const b = fs.readFileSync(file);
   ok('EBML 魔数', b.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3])));
   ok('含 Cues 索引（可拖进度条）', b.includes(Buffer.from([0x1c, 0x53, 0xbb, 0x6b])));
+  const seek = checkWebMSeekStructure(b);
+  ok('SeekHead 三项与全部 Cue 精确定位', seek.errors.length === 0, seek.errors.join('；'));
   ok('含 Opus 音频轨', b.includes(Buffer.from('A_OPUS')));
   // Duration 元素(0x4489) 必须在 Info(0x1549A966) 段的数据范围内找——
   // 裸搜全文会被视频负载/Tracks 里的相同字节误中（实测踩坑两次）
