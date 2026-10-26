@@ -267,9 +267,9 @@ async function invokeExtension() {
   for (let attempt = 1; attempt <= 4; attempt++) {
     if (process.platform === 'win32') {
       if (!process.env.E2E_MANUAL_SHORTCUT) throw new Error('Windows 需要 X11 xdotool，或设置 E2E_MANUAL_SHORTCUT=1 后手动按 Ctrl+Shift+E');
-      console.log('  请在 15 秒内聚焦测试 Chrome 并按 Ctrl+Shift+E…');
+      console.log('  请在 60 秒内聚焦测试 Chrome 并按 Ctrl+Shift+E…');
       await testPage.bringToFront();
-      await sleep(15000);
+      await sleep(60000);
     } else {
       execFileSync('xdotool', ['key', 'ctrl+shift+e']);
     }
