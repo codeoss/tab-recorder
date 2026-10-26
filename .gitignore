@@ -50,6 +50,7 @@ logs/
 .tmp/
 tmp/
 *.tmp
+.worktrees/
 *.swp
 *.swo
 *~
