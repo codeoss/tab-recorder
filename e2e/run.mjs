@@ -100,7 +100,7 @@ patch('offscreen.js', `    OFF_DISCARD: () => { startGen++; if (engine) engine.d
   `    OFF_DISCARD: () => { startGen++; ${RELAY(`'OFF_DISCARD gen='+startGen+' engine='+!!engine`)} if (engine) engine.discard(); return { ok: 1 }; },`);
 
 // 注入后自检：语法坏掉会让 offscreen 整页失效且极难排查，这里直接 fail-fast
-for (const f of ['core-recorder.js', 'offscreen.js', 'recorder.js', 'background.js', 'popup.js']) {
+for (const f of ['core-recorder.js', 'offscreen.js', 'recorder.js', 'background.js', 'popup.js', 'save-file.js']) {
   execFileSync(process.execPath, ['--check', path.join(BUILD, f)]);
 }
 

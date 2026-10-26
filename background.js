@@ -25,7 +25,16 @@ const state = {
   recorderWindowId: 0,
   recorderTabId: 0,        // desktop 模式 recorder 窗口里的 tab id（用于转发指令）
   countdownRemaining: 0,
-  processing: false,       // 引擎正在保存/转码（onStopped 异步链进行中）
+  processing: false,       // 引擎正在保存/转码/等待下载结果（含失败待处理）
+  savePhase: '',           // '' | processing | downloading | complete | error
+  processingStage: '',     // webm-fix | mp4-fix | transcode | download
+  downloadId: 0,
+  saveError: '',
+  saveFilename: '',
+  saveWindowId: 0,
+  saveCanRetry: false,
+  saveReceived: 0,
+  saveTotal: 0,
 };
 
 /* ═══════════════════════════════════════════════════════
@@ -46,6 +55,14 @@ function setState(patch) {
   chrome.storage.session.set({ [STATE_KEY]: state }).catch(() => {});
 }
 
+function resetSaveResult() {
+  setState({
+    savePhase: '', processingStage: '', downloadId: 0,
+    saveError: '', saveFilename: '', saveWindowId: 0,
+    saveCanRetry: false, saveReceived: 0, saveTotal: 0,
+  });
+}
+
 /** SW 启动时异步恢复 state；返回 Promise。 */
 function restoreState() {
   return chrome.storage.session.get(STATE_KEY).then(d => {
@@ -57,6 +74,44 @@ function restoreState() {
 
 // 顶层立即发起恢复；route() 会 await 它
 const stateReady = restoreState();
+
+function downloadBasename(path) {
+  return (path || '').replace(/\\/g, '/').split('/').pop() || '';
+}
+
+async function refreshDownloadStatus(downloadId) {
+  if (!downloadId || downloadId !== state.downloadId) return { error: '下载任务不存在或已过期' };
+  const [item] = await chrome.downloads.search({ id: downloadId });
+  if (!item) {
+    setState({ savePhase: 'error', saveError: 'DOWNLOAD_NOT_FOUND' });
+    return { state: 'interrupted', error: 'DOWNLOAD_NOT_FOUND', filename: state.saveFilename, path: '', received: 0, total: 0 };
+  }
+  const currentState = item.state || 'interrupted';
+  const received = item.bytesReceived || 0;
+  const total = item.totalBytes > 0 ? item.totalBytes : 0;
+  const filename = downloadBasename(item.filename) || state.saveFilename;
+  setState({
+    savePhase: currentState === 'complete' ? 'complete' : currentState === 'interrupted' ? 'error' : 'downloading',
+    saveError: item.error || '',
+    saveFilename: filename,
+    saveReceived: received,
+    saveTotal: total,
+  });
+  return {
+    state: currentState,
+    error: item.error,
+    filename,
+    path: item.filename || '',
+    received,
+    total,
+  };
+}
+
+chrome.downloads.onChanged.addListener(async delta => {
+  await stateReady;
+  if (delta.id !== state.downloadId) return;
+  try { await refreshDownloadStatus(delta.id); } catch (_) {}
+});
 
 /* ═══════════════════════════════════════════════════════
    Offscreen 生命周期
@@ -113,6 +168,7 @@ async function route(msg) {
       if (state.status !== 'idle' || state.processing) {
         return { error: '已有录制进行中或仍在保存，请先停止' };
       }
+      resetSaveResult();
       if (msg.source === 'tab' && !msg.compatMode) return await startTabRecording(msg);
       if (msg.source === 'tab' && msg.compatMode)  return await startCompatTabRecording(msg);
       return await startDesktopRecording(msg);
@@ -146,14 +202,44 @@ async function route(msg) {
 
     /* ── 丢弃 ─────────────────────────────────────────── */
     case 'DISCARD_RECORDING': {
+      if (state.processing && (state.savePhase !== 'error' || !state.saveCanRetry)) {
+        return { error: '视频正在保存，暂不能丢弃' };
+      }
       await sendToRecorderEngine('OFF_DISCARD');
-      setState({ status: 'idle', fileSize: 0 }); badge('idle');
+      setState({ status: 'idle', fileSize: 0, processing: false });
+      resetSaveResult();
+      badge('idle');
       return { ok: 1 };
     }
 
     /* ── 状态查询（popup 轮询）────────────────────────── */
     case 'GET_STATE':
       return { ...state };
+
+    case 'SAVE_FILE': {
+      if (!state.processing) return { error: '当前没有待保存的录制' };
+      if (state.savePhase === 'downloading' || state.savePhase === 'complete') {
+        return { error: '当前录制已有下载任务' };
+      }
+      if (typeof msg.url !== 'string' || !msg.url.startsWith('blob:') || !msg.filename) {
+        return { error: '保存参数无效' };
+      }
+      const downloadId = await chrome.downloads.download({
+        url: msg.url,
+        filename: msg.filename,
+        conflictAction: 'uniquify',
+        saveAs: false,
+      });
+      setState({
+        savePhase: 'downloading', processingStage: 'download', downloadId,
+        saveError: '', saveFilename: msg.filename, saveCanRetry: true,
+        saveReceived: 0, saveTotal: 0,
+      });
+      return { downloadId };
+    }
+
+    case 'GET_DOWNLOAD_STATUS':
+      return await refreshDownloadStatus(msg.downloadId);
 
     /* ── offscreen / recorder 窗口取 tab 的 streamId ──────
        延迟到录制真正开始前才取：getMediaStreamId 的 id 应尽快消费，
@@ -194,8 +280,17 @@ async function route(msg) {
       }
       return { ok: 1 };
     }
-    case 'ENGINE_PROCESSING':   // 引擎进入/离开保存链（fixWebM/转码）
-      setState({ processing: !!msg.active });
+    case 'ENGINE_PROCESSING':   // 引擎进入/离开保存链（fixWebM/转码/下载）
+      if (msg.active) {
+        setState({
+          processing: true,
+          savePhase: msg.stage === 'download' ? 'downloading' : 'processing',
+          processingStage: msg.stage || '',
+          saveCanRetry: true,
+        });
+      } else {
+        setState({ processing: false, processingStage: '' });
+      }
       return { ok: 1 };
     case 'RECORDER_STARTED': {
       setState({
