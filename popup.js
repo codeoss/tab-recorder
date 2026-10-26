@@ -20,6 +20,8 @@ const el = {
   fmt: $('fmt'),
   tlH: $('tlH'), tlM: $('tlM'), tlS: $('tlS'),
   hist: $('hist'), deskNote: $('deskNote'),
+  savePanel: $('savePanel'), saveText: $('saveText'), saveProgress: $('saveProgress'),
+  openSaveBtn: $('openSaveBtn'), retrySaveBtn: $('retrySaveBtn'), discardSaveBtn: $('discardSaveBtn'),
 };
 
 let src = 'tab';
@@ -28,6 +30,7 @@ let tick = null;
 let poll = null;
 let bgStart = 0, bgPaused = 0, bgLimit = 0;
 let wasProcessing = false;   // 上次轮询时引擎是否在保存/转码（用于完成时刻刷历史）
+let saveActive = false;      // 保存/下载/可重试失败期间，禁止开始与修改设置
 
 /* ── 初始化 ──────────────────────────────────────────── */
 
@@ -41,6 +44,13 @@ function events() {
   el.rec.addEventListener('click', toggle);
   el.pause.addEventListener('click', togglePause);
   el.discard.addEventListener('click', discard);
+  el.openSaveBtn.addEventListener('click', () => send('OPEN_SAVE_WINDOW'));
+  el.retrySaveBtn.addEventListener('click', async () => {
+    const res = await send('RETRY_SAVE');
+    if (res && res.error) status('pau', res.error);
+    await pollState();
+  });
+  el.discardSaveBtn.addEventListener('click', discard);
   // 倒计时覆盖层全屏盖住弹窗，本身即取消按钮（大点击目标）
   el.cdOvl.addEventListener('click', () => { if (state === 'countdown') stop(); });
 
@@ -124,6 +134,7 @@ async function restore() {
       showLimit();
       if (bg.fileSize > 0) el.size.textContent = fmtMB(bg.fileSize);
     }
+    if (bg) renderSaveState(bg);
   } catch (_) {}
 
   loadHistory();
@@ -143,6 +154,8 @@ function timeLimitSec() {
 }
 
 async function start() {
+  saveActive = false;
+  el.savePanel.classList.add('hidden');
   el.rec.style.pointerEvents = 'none';
   status('rdy', '准备中...');
 
@@ -189,9 +202,14 @@ async function stop() {
   try { await send('STOP_RECORDING'); } catch (_) {}
   state = 'idle'; stopTick(); ui();
   el.cdOvl.classList.add('hidden');   // 取消倒计时时必须收掉覆盖层，否则会停在最后的秒数
-  status('rdy', cancelling ? '已取消' : '录制完成');
   hideLimit();
-  if (!cancelling) setTimeout(loadHistory, 600);
+  if (cancelling) {
+    status('rdy', '已取消');
+  } else {
+    let bg = null;
+    try { bg = await send('GET_STATE'); } catch (_) {}
+    renderSaveState({ ...(bg || {}), processing: true, savePhase: (bg && bg.savePhase) || 'processing' });
+  }
 }
 
 async function togglePause() {
@@ -211,7 +229,9 @@ async function discard() {
   state = 'idle'; stopTick();
   el.timer.textContent = '00:00:00';
   el.size.textContent = '';
-  hideLimit(); ui();
+  hideLimit();
+  wasProcessing = false;
+  renderSaveState({ processing: false, savePhase: '' });
   status('rdy', '已丢弃');
 }
 
@@ -247,23 +267,18 @@ async function pollState() {
     if (!bg) return;
     if (bg.fileSize > 0 && state !== 'idle') el.size.textContent = fmtMB(bg.fileSize);
 
-    // 倒计时：同步本地状态机 + 覆盖层数字；此阶段按钮可用作取消
     if (bg.status === 'countdown') {
       if (state !== 'countdown') { state = 'countdown'; ui(); }
-      el.rec.style.pointerEvents = 'auto';   // start() 里禁用过，倒计时期间恢复以允许取消
+      el.rec.style.pointerEvents = 'auto';
       if (bg.countdownRemaining > 0) showCountdown(bg.countdownRemaining);
     }
 
-    // 自动停止检测
     if (bg.status === 'idle' && state !== 'idle') {
       el.cdOvl.classList.add('hidden');
       state = 'idle'; stopTick(); ui();
-      status('rdy', bgLimit > 0 ? '定时录制完成' : '录制完成');
       hideLimit();
-      setTimeout(loadHistory, 600);
     }
 
-    // 倒计时后开始录制（本地状态可能是 idle 或 countdown——重开 popup 恢复时）
     if (bg.status === 'recording' && (state === 'idle' || state === 'countdown')) {
       el.cdOvl.classList.add('hidden');
       state = 'recording';
@@ -271,26 +286,60 @@ async function pollState() {
       ui(); startTick(); showLimit();
     }
 
-    // 录制中重同步：desktop 模式 RECORDER_STARTED 会修正 bg.startTime
-    // （用户选源耗时原本被计入），本地起点偏差大时跟随修正
     if (bg.status === 'recording' && state === 'recording' &&
         bg.startTime && Math.abs(bg.startTime - bgStart) > 2000) {
       bgStart = bg.startTime; bgPaused = bg.pausedTime;
     }
 
-    // 引擎保存/转码中（tab 模式 STOP 后 bg 即 idle，但文件还在处理）：
-    // 显示「处理中」；处理结束后再提示完成并刷新历史
-    if (state === 'idle') {
-      if (bg.processing) {
-        status('rdy', '正在保存/转码…');
-        wasProcessing = true;
-      } else if (wasProcessing) {
-        wasProcessing = false;
-        status('rdy', '录制完成');
-        setTimeout(loadHistory, 300);
-      }
-    }
+    const active = !!bg.processing || (bg.savePhase === 'error' && !!bg.saveCanRetry);
+    if (wasProcessing && !active && bg.savePhase === 'complete') setTimeout(loadHistory, 300);
+    wasProcessing = active;
+    renderSaveState(bg);
   } catch (_) {}
+}
+
+function renderSaveState(bg) {
+  const phase = bg.savePhase || (bg.processing ? 'processing' : '');
+  saveActive = !!bg.processing || (phase === 'error' && !!bg.saveCanRetry);
+  el.savePanel.classList.toggle('hidden', !phase);
+  el.openSaveBtn.hidden = !(bg.mode === 'tab' && (bg.processing || phase === 'error'));
+  el.retrySaveBtn.hidden = !(phase === 'error' && bg.saveCanRetry);
+  el.discardSaveBtn.hidden = el.retrySaveBtn.hidden;
+  if (!phase) { ui(); return; }
+
+  let title = '';
+  let detail = '';
+  let statusType = 'rdy';
+  let statusText = '';
+  if (phase === 'complete') {
+    title = '已保存：' + (bg.saveFilename || '录制文件');
+    detail = '下载已完成，可以开始新录制';
+    statusText = '录制完成';
+  } else if (phase === 'error') {
+    title = '保存失败：' + (bg.saveError || '未知错误') + (bg.saveCanRetry ? '' : '（无法重试）');
+    detail = bg.saveCanRetry ? '文件仍在内存，可重试或明确丢弃' : '保存上下文已关闭，无法重试';
+    statusType = 'pau';
+    statusText = bg.saveCanRetry ? '保存失败，可重试' : '保存上下文已关闭';
+  } else {
+    const stages = {
+      'webm-fix': '正在整理 WebM 索引',
+      'mp4-fix': '正在修复 MP4 时长与索引',
+      transcode: '正在转码',
+      download: '正在保存到下载目录',
+    };
+    title = phase === 'downloading' ? '正在保存到下载目录' : (stages[bg.processingStage] || '正在整理视频');
+    if (phase === 'downloading' && bg.saveTotal > 0) {
+      const percent = Math.min(100, Math.floor(bg.saveReceived / bg.saveTotal * 100));
+      detail = `${percent}% · ${fmtMB(bg.saveReceived)} / ${fmtMB(bg.saveTotal)}`;
+    } else {
+      detail = '完成前请勿关闭浏览器';
+    }
+    statusText = phase === 'downloading' ? '正在保存到下载目录…' : '正在保存/整理视频…';
+  }
+  el.saveText.textContent = title;
+  el.saveProgress.textContent = detail;
+  ui();
+  if (state === 'idle') status(statusType, statusText);
 }
 
 /* ── UI 状态 ─────────────────────────────────────────── */
@@ -321,7 +370,8 @@ function ui() {
       status('rdy', '倒计时中…');
       break;
   }
-  el.sp.classList.toggle('dis', state !== 'idle');
+  el.sp.classList.toggle('dis', state !== 'idle' || saveActive);
+  el.rec.style.pointerEvents = (state === 'idle' && saveActive) ? 'none' : 'auto';
 }
 
 function status(type, txt) { el.dot.className = `sd ${type}`; el.stxt.textContent = txt; }

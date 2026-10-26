@@ -138,11 +138,53 @@ async function ensureOffscreen() {
    用户关窗无人清理状态，storage.session 里残留假「录制中」。
    ═══════════════════════════════════════════════════════ */
 
+function markSaveContextLost(message) {
+  setState({
+    processing: false,
+    savePhase: 'error',
+    processingStage: '',
+    saveError: message,
+    saveCanRetry: false,
+  });
+  badge('error');
+}
+
+async function openSaveWindow() {
+  if (state.saveWindowId) {
+    try {
+      await chrome.windows.update(state.saveWindowId, { focused: true });
+      return state.saveWindowId;
+    } catch (_) {
+      setState({ saveWindowId: 0 });
+    }
+  }
+  const win = await chrome.windows.create({
+    url: chrome.runtime.getURL('save-status.html'),
+    type: 'popup', width: 420, height: 360, focused: true,
+  });
+  setState({ saveWindowId: win.id });
+  return win.id;
+}
+
+async function reconcileEngineContext() {
+  if (!state.processing || state.savePhase === 'complete' || state.mode !== 'tab') return;
+  if (!chrome.runtime.getContexts) return;
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (!contexts.length) markSaveContextLost('录制上下文已关闭，无法继续保存');
+}
+
 chrome.windows.onRemoved.addListener(async windowId => {
   await stateReady;   // SW 刚被唤醒时 state 可能尚未恢复
+  if (windowId && windowId === state.saveWindowId && state.saveWindowId !== 0) {
+    setState({ saveWindowId: 0 });
+    return;
+  }
   if (windowId && windowId === state.recorderWindowId && state.recorderWindowId !== 0) {
-    if (state.status !== 'idle') {
-      setState({ status: 'idle', recorderWindowId: 0, recorderTabId: 0 });
+    setState({ recorderWindowId: 0, recorderTabId: 0 });
+    if (state.processing && state.savePhase !== 'complete') {
+      markSaveContextLost('录制窗口已关闭，无法继续保存');
+    } else if (state.status !== 'idle') {
+      setState({ status: 'idle' });
       badge('idle');
     }
   }
@@ -214,11 +256,30 @@ async function route(msg) {
 
     /* ── 状态查询（popup 轮询）────────────────────────── */
     case 'GET_STATE':
+      await reconcileEngineContext();
       return { ...state };
+
+    case 'OPEN_SAVE_WINDOW': {
+      if (state.mode !== 'tab') return { error: '当前录制使用桌面保存窗口' };
+      return { ok: 1, windowId: await openSaveWindow() };
+    }
+
+    case 'RETRY_SAVE': {
+      if (state.savePhase !== 'error' || !state.saveCanRetry) {
+        return { error: '当前没有可重试的保存任务' };
+      }
+      setState({
+        processing: true, savePhase: 'processing', processingStage: 'download',
+        downloadId: 0, saveError: '', saveReceived: 0, saveTotal: 0,
+      });
+      badge('saving');
+      const result = await sendToRecorderEngine('OFF_RETRY_SAVE');
+      return { ok: result === false ? 0 : 1 };
+    }
 
     case 'SAVE_FILE': {
       if (!state.processing) return { error: '当前没有待保存的录制' };
-      if (state.savePhase === 'downloading' || state.savePhase === 'complete') {
+      if (state.savePhase === 'complete' || (state.savePhase === 'downloading' && state.downloadId)) {
         return { error: '当前录制已有下载任务' };
       }
       if (typeof msg.url !== 'string' || !msg.url.startsWith('blob:') || !msg.filename) {
@@ -275,6 +336,8 @@ async function route(msg) {
         saveError: msg.message || '保存失败',
         saveCanRetry: canRetry,
       });
+      badge(canRetry ? 'error' : 'idle');
+      if (canRetry && state.mode === 'tab') await openSaveWindow();
       return { ok: 1 };
     }
 
@@ -305,6 +368,8 @@ async function route(msg) {
           processingStage: msg.stage || '',
           saveCanRetry: true,
         });
+        badge('saving');
+        if (state.mode === 'tab') await openSaveWindow();
       } else {
         setState({ processing: false, processingStage: '' });
       }
@@ -339,13 +404,14 @@ async function route(msg) {
 async function sendToRecorderEngine(type, extra = {}) {
   if (state.mode === 'tab') {
     try {
-      await chrome.runtime.sendMessage({ type, target: 'offscreen', ...extra });
-    } catch (_) {}
+      return await chrome.runtime.sendMessage({ type, target: 'offscreen', ...extra });
+    } catch (_) { return null; }
   } else if (state.mode === 'desktop' && state.recorderTabId) {
     try {
-      await chrome.tabs.sendMessage(state.recorderTabId, { type, ...extra });
-    } catch (_) {}
+      return await chrome.tabs.sendMessage(state.recorderTabId, { type, ...extra });
+    } catch (_) { return null; }
   }
+  return null;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -484,6 +550,8 @@ function badge(mode) {
   const m = {
     recording: { text: 'REC', color: '#ff4757' },
     paused:    { text: '❚❚', color: '#ffa502' },
+    saving:    { text: 'SAVE', color: '#ffa502' },
+    error:     { text: '!',   color: '#ff4757' },
     idle:      { text: '',    color: '#000' },
   };
   const b = m[mode] || m.idle;

@@ -99,8 +99,28 @@ patch('offscreen.js', `    OFF_STOP:    () => { startGen++; if (engine) engine.s
 patch('offscreen.js', `    OFF_DISCARD: () => { startGen++; if (engine) engine.discard(); return { ok: 1 }; },`,
   `    OFF_DISCARD: () => { startGen++; ${RELAY(`'OFF_DISCARD gen='+startGen+' engine='+!!engine`)} if (engine) engine.discard(); return { ok: 1 }; },`);
 
+// 保存链路专用门闩（仅测试副本）：延迟下载或模拟一次中断，生产代码零改动。
+// 标志放 storage.session，避免 service worker 在保存途中回收后丢失故障注入条件。
+patch('background.js', `  switch (msg.type) {`,
+  `  switch (msg.type) {
+    case 'E2E_SET_SAVE_GATE':
+      await chrome.storage.session.set({ e2eSaveBlock: !!msg.block, e2eSaveInterrupt: !!msg.interrupt });
+      return { ok: 1 };
+    case 'E2E_GET_SAVE_GATE': {
+      const gate = await chrome.storage.session.get(['e2eSaveBlock', 'e2eSaveInterrupt']);
+      return { block: !!gate.e2eSaveBlock, interrupt: !!gate.e2eSaveInterrupt };
+    }`);
+patch('save-file.js', `      const started = await chrome.runtime.sendMessage({ type: 'SAVE_FILE', url, filename });`,
+  `      let gate = await chrome.runtime.sendMessage({ type: 'E2E_GET_SAVE_GATE' });
+      if (gate?.interrupt) throw new Error('E2E_INTERRUPTED');
+      while (gate?.block) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        gate = await chrome.runtime.sendMessage({ type: 'E2E_GET_SAVE_GATE' });
+      }
+      const started = await chrome.runtime.sendMessage({ type: 'SAVE_FILE', url, filename });`);
+
 // 注入后自检：语法坏掉会让 offscreen 整页失效且极难排查，这里直接 fail-fast
-for (const f of ['core-recorder.js', 'offscreen.js', 'recorder.js', 'background.js', 'popup.js', 'save-file.js']) {
+for (const f of ['core-recorder.js', 'offscreen.js', 'recorder.js', 'background.js', 'popup.js', 'save-file.js', 'save-status.js']) {
   execFileSync(process.execPath, ['--check', path.join(BUILD, f)]);
 }
 
@@ -223,7 +243,7 @@ console.log('扩展 id:', extId);
 
 const testPage = await ctx.newPage();
 await testPage.goto(PAGE_URL);
-const popup = await ctx.newPage();
+let popup = await ctx.newPage();
 await popup.goto(`chrome-extension://${extId}/popup.html`);
 
 // 日志探针收集器
@@ -238,12 +258,19 @@ await popup.evaluate(() => {
 // 必须让测试页保持激活；对 popup 的操作一律用 evaluate（不会改变焦点）
 await testPage.bringToFront();
 
-/** xdotool 在 X11 层按下 _execute_action 快捷键 → 等价用户点击扩展图标，
-    完成 activeTab 调用授权（tabCapture 的硬性前置）。
+/** 按下 _execute_action 快捷键 → 等价用户点击扩展图标，完成 activeTab 调用授权。
+    Linux 用 X11 xdotool；Windows 可设 E2E_MANUAL_SHORTCUT=1，留出真实按键窗口。
     带重试：每次按键后直接探一次 getMediaStreamId 验证授权是否生效 */
 async function invokeExtension() {
   for (let attempt = 1; attempt <= 4; attempt++) {
-    execFileSync('xdotool', ['key', 'ctrl+shift+e']);   // 发给当前聚焦窗口
+    if (process.platform === 'win32') {
+      if (!process.env.E2E_MANUAL_SHORTCUT) throw new Error('Windows 需要 X11 xdotool，或设置 E2E_MANUAL_SHORTCUT=1 后手动按 Ctrl+Shift+E');
+      console.log('  请在 15 秒内聚焦测试 Chrome 并按 Ctrl+Shift+E…');
+      await testPage.bringToFront();
+      await sleep(15000);
+    } else {
+      execFileSync('xdotool', ['key', 'ctrl+shift+e']);
+    }
     await sleep(1000);
     const granted = await popup.evaluate(() => new Promise(res => {
       chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
@@ -255,7 +282,7 @@ async function invokeExtension() {
     if (granted) return;
     console.log(`  …调用授权第 ${attempt} 次未生效，重试`);
   }
-  throw new Error('activeTab 调用授权失败：xdotool 快捷键未生效');
+  throw new Error('activeTab 调用授权失败：扩展快捷键未生效');
 }
 await sleep(500);
 await invokeExtension();
@@ -281,7 +308,10 @@ const ui = {
     const fps = document.getElementById('fps');
     fps.value = '15'; fps.dispatchEvent(new Event('change'));
   }),
-  clickRec: () => popup.evaluate(() => document.getElementById('recBtn').click()),
+  clickRec: async () => {
+    await testPage.bringToFront();
+    await popup.evaluate(() => document.getElementById('recBtn').click());
+  },
   clickPause: () => popup.evaluate(() => document.getElementById('pauseBtn').click()),
   clickOverlay: () => popup.evaluate(() => document.getElementById('cdOvl').click()),
   overlayHidden: () => popup.evaluate(() => document.getElementById('cdOvl').classList.contains('hidden')),
@@ -289,10 +319,29 @@ const ui = {
   timerText: () => popup.evaluate(() => document.getElementById('timer').textContent),
 };
 
-// 停止后等引擎收尾（onStopped 链：编码器排空 → fixWebM → dl）完成
-// VM 软编码 VP9 可能远慢于实时，给足 90s
+// 停止后等引擎收尾（编码器排空 → 修复 → 真实下载终态）
+// VM 软编码 VP9 可能远慢于实时，给足 90s；error 用于显式故障注入场景。
 const settleAfterStop = () =>
-  waitBgState(s => s.status === 'idle' && !s.processing, '停止收尾完成', 90000);
+  waitBgState(s => s.status === 'idle' && !s.processing &&
+    (s.savePhase === 'complete' || s.savePhase === 'error'), '停止收尾完成', 90000);
+
+async function waitSavePage(timeoutMs = 20000) {
+  const t0 = Date.now();
+  for (;;) {
+    const page = ctx.pages().find(p => p.url().endsWith('/save-status.html'));
+    if (page) return page;
+    if (Date.now() - t0 > timeoutMs) throw new Error('等待 save-status.html 超时');
+    await sleep(200);
+  }
+}
+async function setSaveGate(block, interrupt = false) {
+  await popup.evaluate(({ block, interrupt }) =>
+    chrome.runtime.sendMessage({ type: 'E2E_SET_SAVE_GATE', block, interrupt }), { block, interrupt });
+}
+async function historyLength() {
+  return popup.evaluate(() => new Promise(resolve =>
+    chrome.storage.local.get('recordingHistory', d => resolve((d.recordingHistory || []).length))));
+}
 
 try {
   await ui.setLowRes();   // VM 软编码 VP9 很慢，降负载防超时（不影响校验项）
@@ -396,6 +445,88 @@ try {
     checkMp4(path.join(DL_DIR, fileD), { minMs: 2500, maxMs: 9000 });
     await ui.setFormat('webm');   // 还原，避免影响后续场景
   }
+
+  /* ── 场景 E：保存状态可见、失败重试与明确丢弃 ────────── */
+  console.log('\n场景 E：保存状态可见（popup 关闭、延迟下载、失败重试）');
+  await ui.setFormat('webm');
+  await ui.setCountdown(0);
+  const downloadsBeforeE = fs.readdirSync(DL_DIR);
+  const historyBeforeE = await historyLength();
+  async function recordAndStop() {
+    await testPage.bringToFront();
+    await ui.clickRec();
+    await waitBgState(s => s.status === 'recording', 'recording');
+    await waitBgState(s => s.fileSize > 30000, '保存场景录制内容流入', 25000);
+    await sleep(1200);
+    await ui.clickRec();
+  }
+
+  await setSaveGate(true, false);
+  await recordAndStop();
+  let savePage = await waitSavePage();
+  await waitBgState(s => s.savePhase === 'downloading', '下载门闩已生效');
+  ok('延迟下载时出现独立保存窗口', (await savePage.locator('body').innerText()).includes('正在保存'));
+  ok('门闩期间不显示完成', !(await savePage.locator('#title').innerText()).includes('保存完成'));
+  ok('保存中徽章为 SAVE', (await popup.evaluate(() => chrome.action.getBadgeText({}))) === 'SAVE');
+  ok('保存中 START 被拒绝', !!(await popup.evaluate(() =>
+    chrome.runtime.sendMessage({ type: 'START_RECORDING', source: 'tab' }))).error);
+  ok('门闩期间历史未写入', (await historyLength()) === historyBeforeE);
+
+  await popup.close();
+  popup = await ctx.newPage();
+  await popup.goto(`chrome-extension://${extId}/popup.html`);
+  await popup.evaluate(() => {
+    window.__e2eLogs = [];
+    chrome.runtime.onMessage.addListener(msg => {
+      if (msg.type === 'E2E_LOG') window.__e2eLogs.push(Date.now() % 100000 + ' ' + msg.msg);
+    });
+  });
+  ok('popup 关闭后保存窗口仍在', await savePage.evaluate(() => {
+    const event = new Event('beforeunload', { cancelable: true });
+    return !window.dispatchEvent(event) || !!event.returnValue;
+  }));
+  await savePage.close();
+  await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'OPEN_SAVE_WINDOW' }));
+  savePage = await waitSavePage();
+  ok('关闭进度窗口后可重新打开', (await savePage.locator('body').innerText()).includes('正在保存'));
+
+  await setSaveGate(false, false);
+  await settleAfterStop();
+  const fileE = await waitDownload(downloadsBeforeE);
+  checkWebM(path.join(DL_DIR, fileE), { minMs: 1000, maxMs: 10000 });
+  ok('放行后才写入成功历史', (await historyLength()) === historyBeforeE + 1);
+  await savePage.waitForEvent('close', { timeout: 6000 }).catch(error => {
+    if (ctx.pages().includes(savePage)) throw error;
+  });
+  ok('完成后徽章清空', (await popup.evaluate(() => chrome.action.getBadgeText({}))) === '');
+  await testPage.bringToFront();
+  const restarted = await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'START_RECORDING', source: 'tab' }));
+  ok('完成后允许新录制', !restarted.error, JSON.stringify(restarted));
+  await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'DISCARD_RECORDING' }));
+
+  await setSaveGate(false, true);
+  await recordAndStop();
+  await waitBgState(s => s.savePhase === 'error', '下载中断进入失败态', 90000);
+  savePage = await waitSavePage();
+  ok('失败显示可重试且历史不增加', (await savePage.locator('body').innerText()).includes('文件仍在内存') &&
+     (await historyLength()) === historyBeforeE + 1);
+  ok('重试按钮可见且可用', await savePage.locator('#retryBtn').isVisible());
+  await setSaveGate(false, false);
+  await savePage.evaluate(() => document.getElementById('retryBtn').click());
+  await settleAfterStop();
+  const retryFile = await waitDownload([...downloadsBeforeE, fileE]);
+  checkWebM(path.join(DL_DIR, retryFile), { minMs: 1000, maxMs: 10000 });
+  ok('重试成功后才写入历史', (await historyLength()) === historyBeforeE + 2);
+
+  await setSaveGate(false, true);
+  await recordAndStop();
+  await waitBgState(s => s.savePhase === 'error', '再次下载中断', 90000);
+  savePage = await waitSavePage();
+  savePage.once('dialog', dialog => dialog.accept());
+  await savePage.evaluate(() => document.getElementById('discardBtn').click());
+  await waitBgState(s => !s.processing && s.savePhase === '', '明确丢弃后归位');
+  ok('明确丢弃不写历史且解除忙态', (await historyLength()) === historyBeforeE + 2);
+  await setSaveGate(false, false);
 
   console.log('探针轨迹:', JSON.stringify(await popup.evaluate(() => window.__e2eLogs)));
   console.log(failed === 0 ? '\n全部通过 🎉' : `\n${failed} 项失败 ❌`);

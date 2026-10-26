@@ -16,18 +16,25 @@ function harness(initialState = null) {
   const local = {};
   const sent = [];
   const items = new Map();
+  const contexts = [{ contextType: 'OFFSCREEN_DOCUMENT' }];
+  const createdWindows = [];
+  const focusedWindows = [];
   let nextId = 1;
   const chrome = {
     runtime: {
       onMessage: { addListener: fn => { listeners.message = fn; } },
       onInstalled: { addListener: fn => { listeners.installed = fn; } },
       sendMessage: async msg => { sent.push(msg); return { ok: 1 }; },
-      getContexts: async () => [],
+      getContexts: async () => contexts,
       getURL: path => `chrome-extension://test/${path}`,
     },
     windows: {
       onRemoved: { addListener: fn => { listeners.windowRemoved = fn; } },
-      create: async () => ({ id: 100, tabs: [{ id: 200 }] }),
+      create: async options => {
+        createdWindows.push(options);
+        return { id: 100, tabs: [{ id: 200 }] };
+      },
+      update: async id => { focusedWindows.push(id); return { id }; },
       remove: async () => {},
     },
     tabs: {
@@ -85,11 +92,19 @@ function harness(initialState = null) {
     if (!items.has(id)) items.set(id, { id, state: 'in_progress', filename: '', bytesReceived: 0, totalBytes: 100 });
     Object.assign(items.get(id), values);
   }
-  return { chrome, listeners, session, local, sent, items, send, patch };
+  return { chrome, listeners, session, local, sent, items, send, patch, contexts, createdWindows, focusedWindows };
 }
 
 async function processing(h, stage = 'webm-fix') {
   await h.send('ENGINE_PROCESSING', { active: true, stage });
+}
+
+{
+  const h = harness();
+  await processing(h, 'download');
+  const started = await h.send('SAVE_FILE', { url: 'blob:chrome-extension://x/first-download', filename: 'first.webm' });
+  ok('download 阶段但 downloadId=0 时允许首次保存', started.downloadId === 1 &&
+     h.session.recorderState.downloadId === 1, JSON.stringify(started));
 }
 
 {
@@ -175,6 +190,56 @@ async function processing(h, stage = 'webm-fix') {
      state.saveError === '' && state.saveFilename === '' && state.saveCanRetry === false &&
      state.saveReceived === 0 && state.saveTotal === 0 && state.saveWindowId === 0,
      JSON.stringify({ started, state }));
+}
+
+{
+  const h = harness({ status: 'idle', mode: 'tab' });
+  await h.send('ENGINE_PROCESSING', { active: true, stage: 'webm-fix' });
+  ok('tab 保存时自动打开可见窗口', h.createdWindows.length === 1 &&
+     h.createdWindows[0].url === 'chrome-extension://test/save-status.html' &&
+     (await h.send('GET_STATE')).saveWindowId === 100);
+  await h.send('OPEN_SAVE_WINDOW');
+  ok('已有保存窗口聚焦而不重复创建', h.createdWindows.length === 1 && h.focusedWindows[0] === 100);
+  await h.listeners.windowRemoved(100);
+  const closed = await h.send('GET_STATE');
+  ok('关闭进度窗口不影响引擎保存', closed.saveWindowId === 0 && closed.processing === true &&
+     closed.savePhase === 'processing');
+  await h.send('OPEN_SAVE_WINDOW');
+  ok('可重新打开保存进度', h.createdWindows.length === 2 && (await h.send('GET_STATE')).saveWindowId === 100);
+}
+
+{
+  const h = harness({
+    status: 'idle', mode: 'desktop', processing: true, savePhase: 'processing',
+    recorderWindowId: 77, recorderTabId: 88, saveCanRetry: true,
+  });
+  await h.listeners.windowRemoved(77);
+  const state = await h.send('GET_STATE');
+  ok('recorder 上下文销毁显示不可恢复错误并清理忙态', state.processing === false &&
+     state.savePhase === 'error' && state.saveCanRetry === false && state.recorderWindowId === 0 &&
+     !h.local.recordingHistory?.length);
+}
+
+{
+  const h = harness({
+    status: 'idle', mode: 'tab', processing: true, savePhase: 'downloading',
+    saveCanRetry: true, downloadId: 1,
+  });
+  h.contexts.length = 0;
+  const state = await h.send('GET_STATE');
+  ok('offscreen 消失后清除僵尸保存状态', state.processing === false && state.savePhase === 'error' &&
+     state.saveCanRetry === false && !h.local.recordingHistory?.length);
+}
+
+{
+  const h = harness({
+    status: 'idle', mode: 'tab', processing: true, savePhase: 'error',
+    saveCanRetry: true, saveError: 'FILE_NO_SPACE',
+  });
+  const result = await h.send('RETRY_SAVE');
+  const state = await h.send('GET_STATE');
+  ok('RETRY_SAVE 转发到引擎并恢复保存阶段', !result.error && state.savePhase === 'processing' &&
+     state.saveError === '' && h.sent.some(x => x.type === 'OFF_RETRY_SAVE'));
 }
 
 {
