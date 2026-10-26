@@ -19,14 +19,14 @@ import { chromium } from 'playwright-core';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { topBoxes, mvhdDurationMs } from './lib-mp4check.mjs';
 
 const E2E_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CHROME = process.env.CHROME_BIN || '/usr/bin/google-chrome';
 
 globalThis.self = globalThis;
-await import(path.resolve(E2E_DIR, '../mp4-faststart.js'));
+await import(pathToFileURL(path.resolve(E2E_DIR, '../mp4-faststart.js')).href);
 const { mp4FaststartJs } = globalThis;
 
 let failed = 0;
@@ -108,6 +108,7 @@ await browser.close();
 server.close();
 
 const orig = Buffer.from(b64, 'base64');
+fs.mkdirSync(path.join(E2E_DIR, 'downloads'), { recursive: true });
 fs.writeFileSync(path.join(E2E_DIR, 'downloads', 'native-raw.mp4'), orig);
 
 // 1. 原始文件布局：新版 Chrome 写分片 MP4（moov 在前 + moof/mfra），

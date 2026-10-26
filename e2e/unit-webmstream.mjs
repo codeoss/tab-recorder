@@ -20,10 +20,10 @@
  */
 
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 globalThis.self = globalThis;   // fix-webm.js 是经典脚本（IIFE on self）
-await import(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fix-webm.js'));
+await import(pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fix-webm.js')).href);
 const { fixWebMBlob, _fixWebMFullBuffer, _fixWebMStream } = globalThis;
 
 let failed = 0;

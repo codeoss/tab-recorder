@@ -69,7 +69,7 @@ fs.writeFileSync(path.join(BUILD, 'manifest.json'), JSON.stringify(mf, null, 2))
 // E2E 日志探针（仅测试构建）：在引擎关键节点向 harness 广播轨迹，
 // 失败时 dump。生产代码零改动。
 function patch(file, anchor, replacement, { prepend = false } = {}) {
-  let src = fs.readFileSync(path.join(BUILD, file), 'utf8');
+  let src = fs.readFileSync(path.join(BUILD, file), 'utf8').replace(/\r\n/g, '\n');
   if (!src.includes(anchor)) throw new Error(`探针注入点未找到: ${file}: ${anchor.slice(0, 40)}`);
   src = src.replace(anchor, prepend ? replacement + anchor : replacement);
   fs.writeFileSync(path.join(BUILD, file), src);

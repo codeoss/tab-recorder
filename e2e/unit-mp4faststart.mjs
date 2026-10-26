@@ -13,10 +13,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 globalThis.self = globalThis;   // mp4-faststart.js 是经典脚本（IIFE on self）
-await import(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../mp4-faststart.js'));
+await import(pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../mp4-faststart.js')).href);
 const { mp4FaststartJs } = globalThis;
 
 let failed = 0;
