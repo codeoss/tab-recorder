@@ -319,6 +319,8 @@
     const moov = boxes.find(b => b.type === 'moov');
     const mdat = boxes.find(b => b.type === 'mdat');
     if (!moov || !mdat) throw new Error('未找到 moov/mdat，不是常规 MP4');
+    // TODO: fMP4 with moov after the first mdat needs dedicated relocation
+    // and fragment-offset repair. See docs/todo/moov-at-end-fmp4.md.
     if (moov.off < mdat.off) {
       if (boxes.some(b => b.type === 'moof')) return await fixFragmentedMp4(blob, boxes, moov);
       return blob;   // 已是 faststart 且非分片，无需处理
