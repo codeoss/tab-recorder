@@ -508,6 +508,11 @@ try {
   const restarted = await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'START_RECORDING', source: 'tab' }));
   ok('完成后允许新录制', !restarted.error, JSON.stringify(restarted));
   await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'DISCARD_RECORDING' }));
+  await waitBgState(s => s.status === 'idle' && !s.processing, '新录制丢弃后归位');
+  // 直接发 START/DISCARD 不经过 popup 本地方法；若轮询恰好在Discard前返回
+  // recording，下一次点击会误发 STOP。等真实按钮文案归位再录下一段。
+  await popup.waitForFunction(() =>
+    document.getElementById('recLabel').textContent === '点击开始录制', null, { timeout: 5000 });
 
   await setSaveGate(false, true);
   await recordAndStop();
