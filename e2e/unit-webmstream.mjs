@@ -19,6 +19,7 @@
  *  14. 无可验证关键帧                              → 原样返回
  *  15. unknown-size Cluster + 大音频负载           → 跳负载且只读头部
  *  16. 尾部 unknown-size Cluster + 追加 Cues       → 元数据不算媒体负载
+ *  补充：异常时间顺序、截断块与不可信 Info       → 不猜测、不修改媒体
  *
  * 运行：node e2e/unit-webmstream.mjs
  */
@@ -497,6 +498,32 @@ await expectOriginal('截断的 ReferenceBlock', wrapDefinite([
     reads.every(([start, end]) => end - start <= 65536 && end - start < bytes.length) &&
     total <= bytes.length + 2 * 65536, JSON.stringify(reads));
 }
+
+/* 21. 负时间码的首个候选不得遮住同 Cluster 后续有效关键帧 */
+{
+  const bytes = wrapDefinite([
+    info({}), tracks,
+    el(CLUSTER, cat(
+      el(TIMECODE, uintBytes(0)),
+      simpleBlock({ track: 1, relative: -20, keyframe: true }),
+      blockGroup({ track: 1, relative: 40 }),
+    )),
+    el(CLUSTER, cat(
+      el(TIMECODE, uintBytes(100)),
+      blockGroup({ track: 1, relative: -120 }),
+      simpleBlock({ track: 1, relative: 60, keyframe: true }),
+    )),
+  ]);
+  const fixed = await golden('负时间码首个候选后继续扫描', bytes, 1000);
+  const report = checkWebMKeyframeCues(fixed);
+  ok('  · 负时间候选不遮住后续有效关键帧',
+    JSON.stringify(report.cueTimes) === '[40,160]', JSON.stringify(report.cueTimes));
+}
+
+/* 22. Info 缺少 TimecodeScale 时不得猜测 Duration 或接受不同的编辑策略 */
+await expectOriginal('Info 缺少 TimecodeScale', wrapDefinite([
+  el(INFO, el(DURATION, new Uint8Array(8))), tracks, cluster(0),
+]));
 
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n全部通过 🎉');
 process.exit(failed ? 1 : 0);
