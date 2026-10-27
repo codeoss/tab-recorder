@@ -164,7 +164,7 @@ function videoBlock(b, block, trackNumber, clusterTime) {
   };
 }
 
-function clusterKeyframe(b, cluster, trackNumber, mediaEnd) {
+function clusterKeyframe(b, cluster, trackNumber, mediaEnd, expectedTime = null) {
   const end = cluster.unknown ? mediaEnd : cluster.end;
   let clusterTime = null;
   for (let pos = cluster.dataOff; pos < end;) {
@@ -177,7 +177,7 @@ function clusterKeyframe(b, cluster, trackNumber, mediaEnd) {
     } else if (child.id === ID.SIMPLEBLOCK) {
       if (clusterTime === null) { pos = child.end; continue; }
       const block = videoBlock(b, child, trackNumber, clusterTime);
-      if (block && (block.flags & 0x80)) return block;
+      if (block && (block.flags & 0x80) && (expectedTime === null || block.time === expectedTime)) return block;
     } else if (child.id === ID.BLOCKGROUP) {
       if (clusterTime === null) { pos = child.end; continue; }
       const group = completeChildren(b, child.dataOff, child.end);
@@ -186,7 +186,7 @@ function clusterKeyframe(b, cluster, trackNumber, mediaEnd) {
         for (const item of group) {
           if (item.id !== ID.BLOCK) continue;
           const block = videoBlock(b, item, trackNumber, clusterTime);
-          if (block) return block;
+          if (block && (expectedTime === null || block.time === expectedTime)) return block;
         }
       }
     }
@@ -213,7 +213,7 @@ export function checkWebMKeyframeCues(b) {
     }
     const cluster = readElement(b, segment.dataOff + cue.clusterPosition);
     const keyframe = cluster && cluster.id === ID.CLUSTER
-      ? clusterKeyframe(b, cluster, trackNumber, cues.off) : null;
+      ? clusterKeyframe(b, cluster, trackNumber, cues.off, cue.time) : null;
     if (!keyframe) errors.push(`Cue(${cue.time}) 未指向视频关键帧`);
     else if (keyframe.time !== cue.time) {
       errors.push(`CueTime=${cue.time}，关键帧时间=${keyframe.time}`);

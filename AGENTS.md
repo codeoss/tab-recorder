@@ -77,6 +77,8 @@ fix-webm.js           # 手写 EBML 解析器：补 SeekHead + 只为真实视�
                       # CueTime=Cluster.Timecode+Block 相对时间码，CueTrack 为真实视频轨号。
                       # 必须有合法 Cluster.Timestamp；BlockGroup 子元素须完整解析到组尾，
                       # 缺失/晚到时间码前的 Block、截断 ReferenceBlock 均不猜关键帧。
+                      # 负合成时间码候选跳过并继续扫描；Info 未通过完整校验时，
+                      # legacy 与 streaming 都原样返回，不猜 Duration 或索引。
                       # SeekPosition/CueClusterPosition 均相对 Segment 数据区；头部插入统一计位移。
                       # 流式实现（生产路径）：256KB 滑窗扫描 + 稀疏编辑 + Blob.slice 拼装，
                       # 跳过音频/媒体负载，内存 O(窗口+Cues)；legacy 全量实现保留为 golden 对照

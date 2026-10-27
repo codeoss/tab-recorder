@@ -276,7 +276,7 @@
       } else if (id.id === ID.SIMPLE_BLOCK) {
         if (clusterTime === null) { pos = dataOff + sz.val; continue; }
         const block = blockHeaderSync(dv, dataOff, dataOff + sz.val, videoTrack);
-        if (block && (block.flags & 0x80)) return clusterTime + block.relative;
+        if (block && (block.flags & 0x80) && clusterTime + block.relative >= 0) return clusterTime + block.relative;
       } else if (id.id === ID.BLOCK_GROUP) {
         if (clusterTime === null) { pos = dataOff + sz.val; continue; }
         const groupEnd = dataOff + sz.val;
@@ -295,7 +295,7 @@
           p = childData + childSz.val;
         }
         if (p !== groupEnd) complete = false;
-        if (complete && candidate !== null && !referenced) return clusterTime + candidate;
+        if (complete && candidate !== null && !referenced && clusterTime + candidate >= 0) return clusterTime + candidate;
         if (!complete) break;
       }
       pos = dataOff + sz.val;
@@ -395,7 +395,6 @@
         // phantom overwrites the real Info and Duration gets inserted into
         // media data (this corrupted a real 632MB recording).
         infoSeen = true;
-        infoOff = cur;
         infoLen = elId.len + elSz.len + (elSz.unknown ? 0 : elSz.val);
         const iSzOff = szOff, iSzLen = elSz.len;
 
@@ -422,6 +421,7 @@
           ic = cData + cSz.val;
         }
         if (clean && sawScale && ic === infoEnd) {
+          infoOff = cur;
           infoSzOff = iSzOff;
           infoSzLen = iSzLen;
           infoDefinite = true;
@@ -762,7 +762,7 @@
       } else if (id.id === ID.SIMPLE_BLOCK) {
         if (clusterTime === null) { pos = dataOff + sz.val; continue; }
         const block = await blockHeader(rd, dataOff, dataOff + sz.val, videoTrack);
-        if (block && (block.flags & 0x80)) return clusterTime + block.relative;
+        if (block && (block.flags & 0x80) && clusterTime + block.relative >= 0) return clusterTime + block.relative;
       } else if (id.id === ID.BLOCK_GROUP) {
         if (clusterTime === null) { pos = dataOff + sz.val; continue; }
         const groupEnd = dataOff + sz.val;
@@ -781,7 +781,7 @@
           p = childData + childSz.val;
         }
         if (p !== groupEnd) complete = false;
-        if (complete && candidate !== null && !referenced) return clusterTime + candidate;
+        if (complete && candidate !== null && !referenced && clusterTime + candidate >= 0) return clusterTime + candidate;
         if (!complete) break;
       }
       pos = dataOff + sz.val;
