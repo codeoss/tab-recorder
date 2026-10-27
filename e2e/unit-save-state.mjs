@@ -377,6 +377,27 @@ for (const request of [{ source: 'window' }, { source: 'tab', compatMode: true }
 }
 
 {
+  const h = harness({
+    status: 'recording', mode: 'desktop', startTime: 1000,
+    recorderWindowId: 77, recorderTabId: 88,
+  });
+  const result = await h.send('OPEN_RECORDER_WINDOW');
+  ok('聚焦已有 recorder 而不创建新窗口', result.ok === 1 && result.windowId === 77 &&
+    h.focusedWindows[0] === 77 && h.createdWindows.length === 0, JSON.stringify(result));
+}
+
+for (const initial of [
+  { status: 'recording', mode: 'tab' },
+  { status: 'preparing', mode: 'desktop', recorderWindowId: 77, missingWindow: true },
+]) {
+  const h = harness(initial);
+  if (initial.missingWindow) h.chrome.windows.update = async () => { throw new Error('窗口不存在'); };
+  const result = await h.send('OPEN_RECORDER_WINDOW');
+  ok('tab 或失效 recorder 窗口不得伪造聚焦成功', !!result.error && h.createdWindows.length === 0,
+    JSON.stringify(result));
+}
+
+{
   const saveFilePath = path.join(ROOT, 'save-file.js');
   if (!fs.existsSync(saveFilePath)) {
     ok('saveFileViaBackground 已定义', false);

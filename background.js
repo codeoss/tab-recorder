@@ -299,6 +299,18 @@ async function route(msg) {
       await reconcileEngineContext();
       return { ...state };
 
+    case 'OPEN_RECORDER_WINDOW': {
+      if (state.mode !== 'desktop' || !state.recorderWindowId) {
+        return { error: '当前没有可打开的录制窗口' };
+      }
+      try {
+        await chrome.windows.update(state.recorderWindowId, { focused: true });
+        return { ok: 1, windowId: state.recorderWindowId };
+      } catch (_) {
+        return { error: '录制窗口已关闭或不可用' };
+      }
+    }
+
     case 'OPEN_SAVE_WINDOW': {
       if (state.mode !== 'tab') return { error: '当前录制使用桌面保存窗口' };
       return { ok: 1, windowId: await openSaveWindow() };

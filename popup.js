@@ -26,6 +26,7 @@ const el = {
 
 let src = 'tab';
 let state = 'idle';
+let recorderWindowMode = false;
 let tick = null;
 let poll = null;
 let bgStart = 0, bgPaused = 0, bgLimit = 0;
@@ -126,6 +127,7 @@ async function restore() {
   // 检测是否有进行中的录制
   try {
     const bg = await send('GET_STATE');
+    recorderWindowMode = !!bg && bg.mode === 'desktop';
     if (bg && bg.status !== 'idle') {
       state = bg.status;
       bgStart = bg.startTime; bgPaused = bg.pausedTime; bgLimit = bg.timeLimit;
@@ -144,8 +146,13 @@ async function restore() {
 /* ── 录制控制 ────────────────────────────────────────── */
 
 async function toggle() {
-  if (state === 'idle') await start();
-  else await stop();
+  if (state === 'idle') { await start(); return; }
+  if (recorderWindowMode) {
+    const result = await send('OPEN_RECORDER_WINDOW');
+    if (result?.error) status('pau', result.error);
+    return;
+  }
+  await stop();
 }
 
 function timeLimitSec() {
@@ -184,6 +191,7 @@ async function start() {
     el.cdOvl.classList.add('hidden');
 
     const usesRecorderWindow = (src !== 'tab') || isCompatTab;
+    recorderWindowMode = usesRecorderWindow;
     bgPaused = 0; bgLimit = timeLimitSec();
     if (usesRecorderWindow) {
       state = 'preparing';
@@ -281,6 +289,7 @@ async function pollState() {
   try {
     const bg = await send('GET_STATE');
     if (!bg) return;
+    recorderWindowMode = bg.mode === 'desktop';
     if (bg.fileSize > 0 && state !== 'idle') el.size.textContent = fmtMB(bg.fileSize);
 
     if (bg.status === 'preparing') {
@@ -302,7 +311,13 @@ async function pollState() {
       hideLimit();
     }
 
-    if (bg.status === 'recording' && (state === 'idle' || state === 'countdown' || state === 'preparing')) {
+    if (bg.status === 'paused') {
+      if (state !== 'paused') { state = 'paused'; stopTick(); }
+      bgStart = bg.startTime; bgPaused = bg.pausedTime; bgLimit = bg.timeLimit;
+      ui(); showLimit();
+    }
+
+    if (bg.status === 'recording' && (state === 'idle' || state === 'countdown' || state === 'preparing' || state === 'paused')) {
       el.cdOvl.classList.add('hidden');
       state = 'recording';
       bgStart = bg.startTime; bgPaused = bg.pausedTime; bgLimit = bg.timeLimit;
@@ -368,36 +383,51 @@ function renderSaveState(bg) {
 /* ── UI 状态 ─────────────────────────────────────────── */
 
 function ui() {
-  switch (state) {
-    case 'idle':
-      el.rec.className = 'rb'; el.label.textContent = '点击开始录制';
-      el.ctrls.classList.add('hidden'); el.timer.classList.remove('on');
-      status('rdy', '就绪 — 关闭面板不影响录制');
-      break;
-    case 'recording':
-      el.rec.className = 'rb rec'; el.label.textContent = '点击停止录制';
-      el.ctrls.classList.remove('hidden'); el.pause.innerHTML = '⏸ 暂停';
-      el.timer.classList.add('on');
-      status('rec', '录制中… 可安全关闭面板');
-      break;
-    case 'paused':
-      el.rec.className = 'rb pau'; el.label.textContent = '点击停止录制';
-      el.ctrls.classList.remove('hidden'); el.pause.innerHTML = '▶ 继续';
-      el.timer.classList.add('on');
-      status('pau', '已暂停');
-      break;
-    case 'preparing':
-      el.rec.className = 'rb pau'; el.label.textContent = '点击取消等待';
-      el.ctrls.classList.add('hidden'); el.timer.classList.remove('on');
+  if (recorderWindowMode && ['preparing', 'recording', 'paused'].includes(state)) {
+    el.rec.className = state === 'recording' ? 'rb' : 'rb pau';
+    el.label.textContent = '打开录制窗口';
+    el.ctrls.classList.add('hidden');
+    el.timer.classList.toggle('on', state !== 'preparing');
+    if (state === 'preparing') {
       hideLimit();
       status('rdy', '等待选择录制画面和音频，尚未开始录制');
-      break;
-    case 'countdown':
-      // 倒计时阶段：按钮可用作取消（stop 路径会中止 offscreen 的倒计时）
-      el.rec.className = 'rb pau'; el.label.textContent = '点击取消倒计时';
-      el.ctrls.classList.add('hidden'); el.timer.classList.remove('on');
-      status('rdy', '倒计时中…');
-      break;
+    } else if (state === 'paused') {
+      status('pau', '已暂停，请在录制窗口继续');
+    } else {
+      status('rec', '录制中，请在录制窗口操作');
+    }
+  } else {
+    switch (state) {
+      case 'idle':
+        el.rec.className = 'rb'; el.label.textContent = '点击开始录制';
+        el.ctrls.classList.add('hidden'); el.timer.classList.remove('on');
+        status('rdy', '就绪 — 关闭面板不影响录制');
+        break;
+      case 'recording':
+        el.rec.className = 'rb rec'; el.label.textContent = '点击停止录制';
+        el.ctrls.classList.remove('hidden'); el.pause.innerHTML = '⏸ 暂停';
+        el.timer.classList.add('on');
+        status('rec', '录制中… 可安全关闭面板');
+        break;
+      case 'paused':
+        el.rec.className = 'rb pau'; el.label.textContent = '点击停止录制';
+        el.ctrls.classList.remove('hidden'); el.pause.innerHTML = '▶ 继续';
+        el.timer.classList.add('on');
+        status('pau', '已暂停');
+        break;
+      case 'preparing':
+        el.rec.className = 'rb pau'; el.label.textContent = '打开录制窗口';
+        el.ctrls.classList.add('hidden'); el.timer.classList.remove('on');
+        hideLimit();
+        status('rdy', '等待选择录制画面和音频，尚未开始录制');
+        break;
+      case 'countdown':
+        // 倒计时阶段：按钮可用作取消（stop 路径会中止 offscreen 的倒计时）
+        el.rec.className = 'rb pau'; el.label.textContent = '点击取消倒计时';
+        el.ctrls.classList.add('hidden'); el.timer.classList.remove('on');
+        status('rdy', '倒计时中…');
+        break;
+    }
   }
   el.sp.classList.toggle('dis', state !== 'idle' || saveActive);
   el.rec.style.pointerEvents = (state === 'idle' && saveActive) ? 'none' : 'auto';

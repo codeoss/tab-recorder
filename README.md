@@ -73,6 +73,8 @@ tab-recorder-ext/
 - **标签页模式**：录制引擎跑在 [offscreen document](https://developer.chrome.com/docs/extensions/reference/api/offscreen) 内，这是一个独立于任何窗口的后台页面，popup 关闭、Chrome 最小化都不影响其持有的 `MediaRecorder`。
 - **窗口/屏幕模式**：扩展会弹出一个独立的 popup 窗口，其副标题写明「此窗口可最小化，录制不会中断」。`getDisplayMedia` / `getUserMedia` 的媒体流与窗口可见性无关。
 
+**窗口/屏幕/兼容模式的控制统一在 recorder 窗口完成**：开始、暂停、停止和丢弃都在该窗口操作；主弹窗只显示状态并提供「打开录制窗口」。选择画面和音频期间处于准备状态，尚未开始录制，实际开始后才显示并累计录制时间。
+
 ### 防静音（重要）
 
 `tabCapture` 会把标签页音频「劫持」走，导致录制时用户听不到声音。本扩展用 `AudioContext` 把音频接到扬声器做回环，勾选「录制时保持标签页声音」即可在录制时继续听到。

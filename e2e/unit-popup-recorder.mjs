@@ -101,5 +101,43 @@ for (const [source, compat] of [['window', false], ['tab', true]]) {
     h.messages.some(x => x.type === 'START_RECORDING' && x.countdownSec === 3));
 }
 
+for (const status of ['preparing', 'recording', 'paused']) {
+  const h = popupWith({
+    status, mode: 'desktop', startTime: status === 'preparing' ? 0 : 1000,
+    pausedTime: 500, recorderWindowId: 77,
+  });
+  await h.test.pollState();
+  await h.test.toggle();
+  ok(`${status} 主按钮只聚焦 recorder`, h.messages.some(x => x.type === 'OPEN_RECORDER_WINDOW') &&
+    !h.messages.some(x => ['STOP_RECORDING', 'PAUSE_RECORDING', 'DISCARD_RECORDING'].includes(x.type)),
+    JSON.stringify(h.messages));
+  ok(`${status} 主 popup 隐藏第二套录制控制`,
+    h.test.el.ctrls.classList.contains('hidden') && h.test.el.label.textContent.includes('打开录制窗口'),
+    h.test.el.label.textContent);
+}
+
+{
+  const h = popupWith({ status: 'paused', mode: 'desktop', startTime: 1000, pausedTime: 500 });
+  await h.test.pollState();
+  ok('recorder 本地暂停后重开 popup 不计时', h.test.state === 'paused' && !h.test.tickActive &&
+    h.test.el.stxt.textContent.includes('暂停'), `${h.test.state} / ${h.test.el.stxt.textContent}`);
+  h.bg.status = 'recording';
+  h.bg.pausedTime = 1500;
+  await h.test.pollState();
+  ok('recorder 恢复后按 background 时间继续',
+    h.test.state === 'recording' && h.test.tickActive && h.test.startTime === 1000);
+}
+
+{
+  const h = popupWith({ status: 'recording', mode: 'tab', startTime: 1000 });
+  await h.test.pollState();
+  await h.test.togglePause();
+  ok('普通 tab 保留暂停控制', h.messages.some(x => x.type === 'PAUSE_RECORDING') &&
+    !h.test.el.ctrls.classList.contains('hidden'));
+  await h.test.toggle();
+  ok('普通 tab 保留停止控制', h.messages.some(x => x.type === 'STOP_RECORDING') &&
+    !h.messages.some(x => x.type === 'OPEN_RECORDER_WINDOW'), JSON.stringify(h.messages));
+}
+
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n录制窗口状态测试全部通过 🎉');
 process.exit(failed ? 1 : 0);
