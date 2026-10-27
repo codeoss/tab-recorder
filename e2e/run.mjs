@@ -511,6 +511,9 @@ try {
   await recordAndStop();
   await waitBgState(s => s.savePhase === 'error', '下载中断进入失败态', 90000);
   savePage = await waitSavePage();
+  // 保存状态页是异步渲染的（load 后先拉 GET_STATE），找到页面时首帧
+  // 可能还是占位内容——先等错误态渲出来再断言（实测快慢机器上时序不同）
+  await savePage.locator('#retryBtn').waitFor({ state: 'visible', timeout: 15000 });
   ok('失败显示可重试且历史不增加', (await savePage.locator('body').innerText()).includes('文件仍在内存') &&
      (await historyLength()) === historyBeforeE + 1);
   ok('重试按钮可见且可用', await savePage.locator('#retryBtn').isVisible());
