@@ -1,6 +1,7 @@
 /**
  * 独立 EBML 校验器：不调用生产解析逻辑，精确验证 SeekHead 三项、
- * 全部 Cue 的 Cluster 落点、Segment 尺寸，以及修复前后 Cluster 负载不变。
+ * CueTrack/CueTime/Cluster 落点、视频关键帧、Segment 尺寸，以及修复前后
+ * Cluster 负载不变；已有 Cues 不得被算进 unknown-size Cluster 负载。
  */
 const ID = {
   EBML: 0x1A45DFA3,
@@ -18,6 +19,14 @@ const ID = {
   CUETIME: 0xB3,
   CUETRACKPOS: 0xB7,
   CUECLUSTER: 0xF1,
+  CUETRACK: 0xF7,
+  TRACKENTRY: 0xAE,
+  TRACKNUMBER: 0xD7,
+  TRACKTYPE: 0x83,
+  SIMPLEBLOCK: 0xA3,
+  BLOCKGROUP: 0xA0,
+  BLOCK: 0xA1,
+  REFERENCEBLOCK: 0xFB,
 };
 const NAME = Object.fromEntries(Object.entries(ID).map(([name, id]) => [id, name]));
 
@@ -98,14 +107,103 @@ function cueEntries(b, cues) {
     const time = pointChildren.find(x => x.id === ID.CUETIME);
     const trackPos = pointChildren.find(x => x.id === ID.CUETRACKPOS);
     if (!time || !trackPos) continue;
-    const cluster = children(b, trackPos.dataOff, trackPos.end).find(x => x.id === ID.CUECLUSTER);
-    if (!cluster) continue;
+    const positions = children(b, trackPos.dataOff, trackPos.end);
+    const cluster = positions.find(x => x.id === ID.CUECLUSTER);
+    const track = positions.find(x => x.id === ID.CUETRACK);
+    if (!cluster || !track) continue;
     out.push({
       time: uint(b, time.dataOff, time.end - time.dataOff),
+      track: uint(b, track.dataOff, track.end - track.dataOff),
       clusterPosition: uint(b, cluster.dataOff, cluster.end - cluster.dataOff),
     });
   }
   return out;
+}
+
+function videoTrackNumber(b, segment) {
+  for (let pos = segment.dataOff; pos < b.length;) {
+    const el = readElement(b, pos);
+    if (!el || el.unknown || el.id === ID.CLUSTER) break;
+    if (el.id === ID.TRACKS) {
+      for (const entry of children(b, el.dataOff, el.end)) {
+        if (entry.id !== ID.TRACKENTRY) continue;
+        const fields = children(b, entry.dataOff, entry.end);
+        const number = fields.find(x => x.id === ID.TRACKNUMBER);
+        const type = fields.find(x => x.id === ID.TRACKTYPE);
+        if (number && type && uint(b, type.dataOff, type.end - type.dataOff) === 1) {
+          return uint(b, number.dataOff, number.end - number.dataOff);
+        }
+      }
+    }
+    if (el.end <= pos) break;
+    pos = el.end;
+  }
+  return 0;
+}
+
+function videoBlock(b, block, trackNumber, clusterTime) {
+  const track = readSize(b, block.dataOff);
+  if (!track || track.value !== trackNumber || block.dataOff + track.len + 3 > block.end) return null;
+  const at = block.dataOff + track.len;
+  const rawTime = (b[at] << 8) | b[at + 1];
+  return {
+    time: clusterTime + (rawTime & 0x8000 ? rawTime - 0x10000 : rawTime),
+    flags: b[at + 2],
+  };
+}
+
+function clusterKeyframe(b, cluster, trackNumber, mediaEnd) {
+  const end = cluster.unknown ? mediaEnd : cluster.end;
+  let clusterTime = 0;
+  for (let pos = cluster.dataOff; pos < end;) {
+    const child = readElement(b, pos);
+    if (!child || child.unknown || child.end > end || child.end <= pos) break;
+    if (child.id === ID.CLUSTER || child.id === ID.CUES) break;
+    if (child.id === ID.TIMECODE) {
+      clusterTime = uint(b, child.dataOff, child.end - child.dataOff);
+    } else if (child.id === ID.SIMPLEBLOCK) {
+      const block = videoBlock(b, child, trackNumber, clusterTime);
+      if (block && (block.flags & 0x80)) return block;
+    } else if (child.id === ID.BLOCKGROUP) {
+      const group = children(b, child.dataOff, child.end);
+      if (!group.some(x => x.id === ID.REFERENCEBLOCK)) {
+        for (const item of group) {
+          if (item.id !== ID.BLOCK) continue;
+          const block = videoBlock(b, item, trackNumber, clusterTime);
+          if (block) return block;
+        }
+      }
+    }
+    pos = child.end;
+  }
+  return null;
+}
+
+export function checkWebMKeyframeCues(b) {
+  const errors = [];
+  const ebml = readElement(b, 0);
+  const segment = ebml && readElement(b, ebml.end);
+  if (!segment || segment.id !== ID.SEGMENT) return { errors: ['缺 Segment'], cues: [], cueTimes: [] };
+  const trackNumber = videoTrackNumber(b, segment);
+  const cues = findCues(b);
+  if (!trackNumber) errors.push('未找到视频 TrackNumber');
+  if (!cues) errors.push('文件尾缺 Cues');
+  const entries = cues ? cueEntries(b, cues) : [];
+  if (!entries.length) errors.push('Cues 没有有效 CuePoint');
+  for (const cue of entries) {
+    if (cue.track !== trackNumber) {
+      errors.push(`Cue(${cue.time}) Track=${cue.track}，视频轨=${trackNumber}`);
+      continue;
+    }
+    const cluster = readElement(b, segment.dataOff + cue.clusterPosition);
+    const keyframe = cluster && cluster.id === ID.CLUSTER
+      ? clusterKeyframe(b, cluster, trackNumber, cues.off) : null;
+    if (!keyframe) errors.push(`Cue(${cue.time}) 未指向视频关键帧`);
+    else if (keyframe.time !== cue.time) {
+      errors.push(`CueTime=${cue.time}，关键帧时间=${keyframe.time}`);
+    }
+  }
+  return { errors, cues: entries, cueTimes: entries.map(x => x.time) };
 }
 
 export function checkWebMSeekStructure(b) {
@@ -196,10 +294,24 @@ export function webMClustersEqual(input, output) {
       }
       at++;
     }
-    return found.map((item, i) => ({
-      time: item.time,
-      raw: b.subarray(item.off, item.el.unknown ? (found[i + 1]?.off ?? mediaEnd) : item.el.end),
-    }));
+    function nextCues(off) {
+      const signature = Buffer.from([0x1C, 0x53, 0xBB, 0x6B]);
+      let at = off;
+      while ((at = b.indexOf(signature, at)) >= 0 && at < mediaEnd) {
+        const el = readElement(b, at);
+        if (el && !el.unknown && el.end <= mediaEnd) {
+          const first = readElement(b, el.dataOff);
+          if (first && first.id === ID.CUEPOINT) return at;
+        }
+        at++;
+      }
+      return mediaEnd;
+    }
+    return found.map((item, i) => {
+      const nextCluster = found[i + 1]?.off ?? mediaEnd;
+      const end = item.el.unknown ? Math.min(nextCluster, nextCues(item.off + 4)) : item.el.end;
+      return { time: item.time, raw: b.subarray(item.off, end) };
+    });
   }
   const a = clusters(input);
   const z = clusters(output);

@@ -3,11 +3,11 @@
  *
  * Chrome's MediaRecorder outputs WebM files that:
  *   1) Have Duration = 0 or absent  → player shows "unknown length"
- *   2) Have NO Cues element         → player CANNOT seek/drag progress bar
+ *   2) Have no Cues, or Cues that do not reliably target video keyframes
  *   3) Have NO SeekHead             → Windows Media Foundation cannot discover Cues
  *
- * This module fixes all three by:
- *   1) Scanning all Cluster elements to read their Timecodes + byte offsets
+ * This module fixes these issues by:
+ *   1) Scanning Cluster/block headers for verified video keyframes and timestamps
  *   2) Building a proper Cues element (seek index) and appending it at EOF
  *   3) Inserting a fixed-size SeekHead whose positions are relative to Segment data
  *   4) Patching Duration in the Info element — or INSERTING one when Chrome
@@ -186,6 +186,13 @@
     CUE_TRACK_POS:0xB7,
     CUE_TRACK:    0xF7,
     CUE_CLUSTER:  0xF1,
+    TRACK_ENTRY:  0xAE,
+    TRACK_NUMBER: 0xD7,
+    TRACK_TYPE:   0x83,
+    SIMPLE_BLOCK: 0xA3,
+    BLOCK_GROUP:  0xA0,
+    BLOCK:        0xA1,
+    REFERENCE_BLOCK: 0xFB,
   };
 
   // Byte representations for writing
@@ -217,6 +224,78 @@
       entry(ID_BYTES.TRACKS, tracksRel),
       entry(ID_BYTES.CUES, cuesRel),
     ));
+  }
+
+  function findVideoTrackSync(dv, start, end) {
+    let pos = start;
+    while (pos < end) {
+      const id = readId(dv, pos);
+      if (!id || id.id !== ID.TRACK_ENTRY) break;
+      const sz = readSize(dv, pos + id.len);
+      if (!sz || sz.unknown) break;
+      const dataOff = pos + id.len + sz.len;
+      const entryEnd = dataOff + sz.val;
+      if (entryEnd > end) break;
+      let number = 0, type = 0;
+      for (let p = dataOff; p < entryEnd;) {
+        const childId = readId(dv, p);
+        const childSz = childId && readSize(dv, p + childId.len);
+        if (!childId || !childSz || childSz.unknown) break;
+        const childData = p + childId.len + childSz.len;
+        if (childData + childSz.val > entryEnd) break;
+        if (childId.id === ID.TRACK_NUMBER) number = readUint(dv, childData, childSz.val);
+        if (childId.id === ID.TRACK_TYPE) type = readUint(dv, childData, childSz.val);
+        p = childData + childSz.val;
+      }
+      if (type === 1) return number;
+      pos = entryEnd;
+    }
+    return 0;
+  }
+
+  function blockHeaderSync(dv, off, end, videoTrack) {
+    const track = readSize(dv, off);
+    if (!track || track.unknown || off + track.len + 3 > end) return null;
+    const flags = dv.getUint8(off + track.len + 2);
+    if (track.val !== videoTrack || (flags & 0x06)) return null;
+    return { relative: dv.getInt16(off + track.len), flags };
+  }
+
+  function findClusterKeyframeSync(dv, start, end, videoTrack) {
+    let clusterTime = 0;
+    for (let pos = start; pos < end;) {
+      const id = readId(dv, pos);
+      if (!id || id.id === ID.CLUSTER || id.id === ID.CUES) break;
+      const sz = readSize(dv, pos + id.len);
+      if (!sz || sz.unknown) break;
+      const dataOff = pos + id.len + sz.len;
+      if (dataOff + sz.val > end) break;
+      if (id.id === ID.TIMECODE) {
+        clusterTime = readUint(dv, dataOff, sz.val);
+      } else if (id.id === ID.SIMPLE_BLOCK) {
+        const block = blockHeaderSync(dv, dataOff, dataOff + sz.val, videoTrack);
+        if (block && (block.flags & 0x80)) return clusterTime + block.relative;
+      } else if (id.id === ID.BLOCK_GROUP) {
+        const groupEnd = dataOff + sz.val;
+        let referenced = false, candidate = null;
+        for (let p = dataOff; p < groupEnd;) {
+          const childId = readId(dv, p);
+          const childSz = childId && readSize(dv, p + childId.len);
+          if (!childId || !childSz || childSz.unknown) break;
+          const childData = p + childId.len + childSz.len;
+          if (childData + childSz.val > groupEnd) break;
+          if (childId.id === ID.REFERENCE_BLOCK) referenced = true;
+          if (childId.id === ID.BLOCK) {
+            const block = blockHeaderSync(dv, childData, childData + childSz.val, videoTrack);
+            if (block) candidate = block.relative;
+          }
+          p = childData + childSz.val;
+        }
+        if (candidate !== null && !referenced) return clusterTime + candidate;
+      }
+      pos = dataOff + sz.val;
+    }
+    return null;
   }
 
   /* ═══════════════════════════════════════════════════════
@@ -263,7 +342,9 @@
     let durationDataOff = -1;         // where Duration float is
     let durationDataLen = 0;
     let timecodeScale = 1000000;
-    const clusters = [];              // { absoluteOff, timecodeMs }
+    const clusters = [];              // Verified video keyframes only
+    let videoTrack = 0;
+    let lastClusterTimecode = -1;
     let cur = segDataStart;
     let infoSeen = false;             // phantom-Info guard: only the first clean Info counts
 
@@ -281,8 +362,7 @@
         const tcSz = readSize(dv, dataOff + childId.len);
         if (!tcSz || tcSz.unknown || tcSz.val < 1 || tcSz.val > 8) return false;
         const tc = readUint(dv, dataOff + childId.len + tcSz.len, tcSz.val);
-        const last = clusters[clusters.length - 1];
-        return !last || tc >= last.timecodeMs;
+        return lastClusterTimecode < 0 || tc >= lastClusterTimecode;
       }
       if (elIdV.id === ID.CUES) return childId.id === ID.CUE_POINT;
       return false;
@@ -296,7 +376,12 @@
       if (!elSz) break;
       const dataOff = szOff + elSz.len;
 
-      if (elId.id === ID.TRACKS) tracksOff = cur;
+      if (elId.id === ID.TRACKS) {
+        tracksOff = cur;
+        if (!videoTrack && !elSz.unknown) {
+          videoTrack = findVideoTrackSync(dv, dataOff, Math.min(dataOff + elSz.val, total));
+        }
+      }
 
       if (elId.id === ID.INFO && !infoSeen) {
         // Only trust the FIRST Info, and only if it parses cleanly (well-formed
@@ -359,11 +444,17 @@
           }
         }
 
-        clusters.push({
-          absoluteOff: cur,
-          relativeOff: cur - segDataStart,
-          timecodeMs: timecodeMs,
-        });
+        lastClusterTimecode = timecodeMs;
+        const keyframeTime = videoTrack
+          ? findClusterKeyframeSync(dv, dataOff, clusterEnd, videoTrack) : null;
+        const last = clusters[clusters.length - 1];
+        if (keyframeTime !== null && keyframeTime >= 0 && (!last || keyframeTime >= last.timecodeMs)) {
+          clusters.push({
+            absoluteOff: cur,
+            relativeOff: cur - segDataStart,
+            timecodeMs: keyframeTime,
+          });
+        }
 
         // For unknown-size clusters, scan forward to find next top-level element
         if (elSz.unknown) {
@@ -430,7 +521,7 @@
     const cuesData = buildCues(clusters.map(c => ({
       relativeOff: c.relativeOff + seekHeadLen,
       timecodeMs: c.timecodeMs,
-    })));
+    })), videoTrack);
     const seekHeadData = buildSeekHead(
       infoOff - segDataStart + seekHeadLen,
       tracksOff - segDataStart + contentDelta,
@@ -490,12 +581,11 @@
      Build Cues Element
      ═══════════════════════════════════════════════════════ */
 
-  function buildCues(clusters) {
+  function buildCues(clusters, videoTrack) {
     // Build CuePoint elements
     const cuePoints = [];
     for (const c of clusters) {
-      // CueTrack = 1 (uint)
-      const cueTrack = encodeElement(ID_BYTES.CUE_TRACK, encodeUint(1));
+      const cueTrack = encodeElement(ID_BYTES.CUE_TRACK, encodeUint(videoTrack));
       // CueClusterPosition = relative offset from Segment data start
       const cueCluster = encodeElement(ID_BYTES.CUE_CLUSTER, encodeUint(c.relativeOff));
       // CueTrackPositions
@@ -616,6 +706,79 @@
     return { total, readId, readSize, readUint, readIdSync };
   }
 
+  async function findVideoTrack(rd, start, end) {
+    let pos = start;
+    while (pos < end) {
+      const id = await rd.readId(pos);
+      if (!id || id.id !== ID.TRACK_ENTRY) break;
+      const sz = await rd.readSize(pos + id.len);
+      if (!sz || sz.unknown) break;
+      const dataOff = pos + id.len + sz.len;
+      const entryEnd = dataOff + sz.val;
+      if (entryEnd > end) break;
+      let number = 0, type = 0;
+      for (let p = dataOff; p < entryEnd;) {
+        const childId = await rd.readId(p);
+        const childSz = childId && await rd.readSize(p + childId.len);
+        if (!childId || !childSz || childSz.unknown) break;
+        const childData = p + childId.len + childSz.len;
+        if (childData + childSz.val > entryEnd) break;
+        if (childId.id === ID.TRACK_NUMBER) number = await rd.readUint(childData, childSz.val);
+        if (childId.id === ID.TRACK_TYPE) type = await rd.readUint(childData, childSz.val);
+        p = childData + childSz.val;
+      }
+      if (type === 1) return number;
+      pos = entryEnd;
+    }
+    return 0;
+  }
+
+  async function blockHeader(rd, off, end, videoTrack) {
+    const track = await rd.readSize(off);
+    if (!track || track.unknown || off + track.len + 3 > end) return null;
+    const flags = await rd.readUint(off + track.len + 2, 1);
+    if (track.val !== videoTrack || (flags & 0x06)) return null;
+    const raw = await rd.readUint(off + track.len, 2);
+    return { relative: raw & 0x8000 ? raw - 0x10000 : raw, flags };
+  }
+
+  async function findClusterKeyframe(rd, start, end, videoTrack) {
+    let clusterTime = 0;
+    for (let pos = start; pos < end;) {
+      const id = await rd.readId(pos);
+      if (!id || id.id === ID.CLUSTER || id.id === ID.CUES) break;
+      const sz = await rd.readSize(pos + id.len);
+      if (!sz || sz.unknown) break;
+      const dataOff = pos + id.len + sz.len;
+      if (dataOff + sz.val > end) break;
+      if (id.id === ID.TIMECODE) {
+        clusterTime = await rd.readUint(dataOff, sz.val);
+      } else if (id.id === ID.SIMPLE_BLOCK) {
+        const block = await blockHeader(rd, dataOff, dataOff + sz.val, videoTrack);
+        if (block && (block.flags & 0x80)) return clusterTime + block.relative;
+      } else if (id.id === ID.BLOCK_GROUP) {
+        const groupEnd = dataOff + sz.val;
+        let referenced = false, candidate = null;
+        for (let p = dataOff; p < groupEnd;) {
+          const childId = await rd.readId(p);
+          const childSz = childId && await rd.readSize(p + childId.len);
+          if (!childId || !childSz || childSz.unknown) break;
+          const childData = p + childId.len + childSz.len;
+          if (childData + childSz.val > groupEnd) break;
+          if (childId.id === ID.REFERENCE_BLOCK) referenced = true;
+          if (childId.id === ID.BLOCK) {
+            const block = await blockHeader(rd, childData, childData + childSz.val, videoTrack);
+            if (block) candidate = block.relative;
+          }
+          p = childData + childSz.val;
+        }
+        if (candidate !== null && !referenced) return clusterTime + candidate;
+      }
+      pos = dataOff + sz.val;
+    }
+    return null;
+  }
+
   /**
    * 流式扫描（legacy Steps 1-3 的逐行等价移植）：只收集「事实」，不物化文件。
    * 返回 null 表示 EBML/Segment 头不合法（等价 legacy 原样返回）。
@@ -652,8 +815,10 @@
       infoSzOff: 0, infoSzLen: 0, infoDefinite: false, infoDataStart: 0, infoDataEnd: -1,
       durationDataOff: -1, durationDataLen: 0,
       timecodeScale: 1000000,
-      clusters: [],   // { absoluteOff, timecodeMs }，relativeOff 编辑阶段再算
+      videoTrack: 0,
+      clusters: [],   // Verified video keyframes only
     };
+    let lastClusterTimecode = -1;
     let infoSeen = false;   // 幻影 Info 防护：只采信第一个且解析干净的 Info
 
     // 候选顶层元素的结构校验：挡掉负载里的同字节幻影。
@@ -669,8 +834,7 @@
         const tcSz = await rd.readSize(dataOff + childId.len);
         if (!tcSz || tcSz.unknown || tcSz.val < 1 || tcSz.val > 8) return false;
         const tc = await rd.readUint(dataOff + childId.len + tcSz.len, tcSz.val);
-        const last = f.clusters[f.clusters.length - 1];
-        return !last || tc >= last.timecodeMs;
+        return lastClusterTimecode < 0 || tc >= lastClusterTimecode;
       }
       if (elId.id === ID.CUES) return childId.id === ID.CUE_POINT;
       return false;
@@ -685,7 +849,12 @@
       if (!elSz) break;
       const dataOff = szOff + elSz.len;
 
-      if (elId.id === ID.TRACKS) f.tracksOff = cur;
+      if (elId.id === ID.TRACKS) {
+        f.tracksOff = cur;
+        if (!f.videoTrack && !elSz.unknown) {
+          f.videoTrack = await findVideoTrack(rd, dataOff, Math.min(dataOff + elSz.val, total));
+        }
+      }
 
       if (elId.id === ID.INFO && !infoSeen) {
         // 只采信第一个 Info，且必须「解析干净」：子元素全部合法、恰好占满、
@@ -726,7 +895,14 @@
           const tcSz = await rd.readSize(dataOff + tcId.len);
           if (tcSz) timecodeMs = await rd.readUint(dataOff + tcId.len + tcSz.len, tcSz.val);
         }
-        f.clusters.push({ absoluteOff: cur, timecodeMs });
+        lastClusterTimecode = timecodeMs;
+        const clusterEnd = elSz.unknown ? segEnd : Math.min(dataOff + elSz.val, total);
+        const keyframeTime = f.videoTrack
+          ? await findClusterKeyframe(rd, dataOff, clusterEnd, f.videoTrack) : null;
+        const last = f.clusters[f.clusters.length - 1];
+        if (keyframeTime !== null && keyframeTime >= 0 && (!last || keyframeTime >= last.timecodeMs)) {
+          f.clusters.push({ absoluteOff: cur, timecodeMs: keyframeTime });
+        }
 
         if (elSz.unknown) {
           let scan = dataOff + 1;
@@ -797,7 +973,7 @@
     const cuesData = buildCues(f.clusters.map(c => ({
       relativeOff: c.absoluteOff - f.segDataStart + contentDelta,
       timecodeMs: c.timecodeMs,
-    })));
+    })), f.videoTrack);
     const seekHeadData = buildSeekHead(
       f.infoOff - f.segDataStart + seekHeadLen,
       f.tracksOff - f.segDataStart + contentDelta,
