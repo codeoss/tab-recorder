@@ -347,6 +347,35 @@ for (const [mode, response] of [['tab', false], ['desktop', { ok: 0 }], ['deskto
      JSON.stringify({ result, state }));
 }
 
+for (const request of [{ source: 'window' }, { source: 'tab', compatMode: true }]) {
+  const h = harness();
+  const started = await h.send('START_RECORDING', request);
+  const pending = await h.send('GET_STATE');
+  const duplicate = await h.send('START_RECORDING', request);
+  ok(`${request.source}${request.compatMode ? '/compat' : ''} 创建窗口后进入准备态`,
+    !started.error && pending.status === 'preparing' && pending.startTime === 0 && !!duplicate.error,
+    JSON.stringify(pending));
+  const before = Date.now();
+  await h.send('RECORDER_STARTED');
+  const actual = await h.send('GET_STATE');
+  ok('RECORDER_STARTED 才写入实际开始时间', actual.status === 'recording' &&
+    actual.startTime >= before && actual.startTime <= Date.now(), JSON.stringify(actual));
+}
+
+{
+  const h = harness({
+    status: 'preparing', mode: 'desktop', processing: false,
+    recorderWindowId: 77, recorderTabId: 88,
+  });
+  const removed = [];
+  h.chrome.windows.remove = async id => { removed.push(id); };
+  await h.send('STOP_RECORDING');
+  const state = await h.send('GET_STATE');
+  ok('准备阶段 STOP 关闭等待窗口且不进入保存链', removed[0] === 77 &&
+    state.status === 'idle' && state.processing === false && !h.local.recordingHistory?.length,
+    JSON.stringify({ removed, state }));
+}
+
 {
   const saveFilePath = path.join(ROOT, 'save-file.js');
   if (!fs.existsSync(saveFilePath)) {

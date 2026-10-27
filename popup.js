@@ -130,8 +130,9 @@ async function restore() {
       state = bg.status;
       bgStart = bg.startTime; bgPaused = bg.pausedTime; bgLimit = bg.timeLimit;
       ui();
-      if (state === 'recording') startTick();
-      showLimit();
+      if (state === 'recording') { startTick(); showLimit(); }
+      else if (state === 'preparing') { stopTick(); hideLimit(); }
+      else showLimit();
       if (bg.fileSize > 0) el.size.textContent = fmtMB(bg.fileSize);
     }
     if (bg) renderSaveState(bg);
@@ -183,11 +184,17 @@ async function start() {
     el.cdOvl.classList.add('hidden');
 
     const usesRecorderWindow = (src !== 'tab') || isCompatTab;
-    state = 'recording';
-    bgStart = Date.now(); bgPaused = 0; bgLimit = timeLimitSec();
-    ui(); startTick(); showLimit();
+    bgPaused = 0; bgLimit = timeLimitSec();
     if (usesRecorderWindow) {
-      status('rec', isCompatTab ? '云桌面兼容模式录制中' : '录制窗口已打开');
+      state = 'preparing';
+      bgStart = 0;
+      stopTick();
+      ui();
+      status('rdy', isCompatTab ? '等待选择屏幕和系统音频，尚未开始录制' : '等待选择录制画面，尚未开始录制');
+    } else {
+      state = 'recording';
+      bgStart = Date.now();
+      ui(); startTick(); showLimit();
     }
   } catch (e) {
     el.cdOvl.classList.add('hidden');
@@ -198,7 +205,7 @@ async function start() {
 }
 
 async function stop() {
-  const cancelling = state === 'countdown';
+  const cancelling = state === 'countdown' || state === 'preparing';
   try { await send('STOP_RECORDING'); } catch (_) {}
   state = 'idle'; stopTick(); ui();
   el.cdOvl.classList.add('hidden');   // 取消倒计时时必须收掉覆盖层，否则会停在最后的秒数
@@ -276,6 +283,13 @@ async function pollState() {
     if (!bg) return;
     if (bg.fileSize > 0 && state !== 'idle') el.size.textContent = fmtMB(bg.fileSize);
 
+    if (bg.status === 'preparing') {
+      el.cdOvl.classList.add('hidden');
+      if (state !== 'preparing') { state = 'preparing'; stopTick(); }
+      bgStart = 0;
+      ui();
+    }
+
     if (bg.status === 'countdown') {
       if (state !== 'countdown') { state = 'countdown'; ui(); }
       el.rec.style.pointerEvents = 'auto';
@@ -288,7 +302,7 @@ async function pollState() {
       hideLimit();
     }
 
-    if (bg.status === 'recording' && (state === 'idle' || state === 'countdown')) {
+    if (bg.status === 'recording' && (state === 'idle' || state === 'countdown' || state === 'preparing')) {
       el.cdOvl.classList.add('hidden');
       state = 'recording';
       bgStart = bg.startTime; bgPaused = bg.pausedTime; bgLimit = bg.timeLimit;
@@ -371,6 +385,12 @@ function ui() {
       el.ctrls.classList.remove('hidden'); el.pause.innerHTML = '▶ 继续';
       el.timer.classList.add('on');
       status('pau', '已暂停');
+      break;
+    case 'preparing':
+      el.rec.className = 'rb pau'; el.label.textContent = '点击取消等待';
+      el.ctrls.classList.add('hidden'); el.timer.classList.remove('on');
+      hideLimit();
+      status('rdy', '等待选择录制画面和音频，尚未开始录制');
       break;
     case 'countdown':
       // 倒计时阶段：按钮可用作取消（stop 路径会中止 offscreen 的倒计时）

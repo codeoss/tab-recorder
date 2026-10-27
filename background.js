@@ -2,7 +2,7 @@
  * background.js — Service Worker (MV3)
  *
  * 职责：
- *   1. 维护全局录制状态机 (idle | countdown | recording | paused)
+ *   1. 维护全局录制状态机 (idle | preparing | countdown | recording | paused)
  *   2. 消息路由：把 popup 的指令分发给 offscreen / recorder 窗口
  *   3. 通过 chrome.tabCapture.getMediaStreamId 取得 streamId 并跨上下文传递
  *   4. 管理录制窗口生命周期与历史记录
@@ -17,7 +17,7 @@
  */
 
 const state = {
-  status: 'idle',          // idle | countdown | recording | paused
+  status: 'idle',          // idle | preparing | countdown | recording | paused
   startTime: 0,
   pausedTime: 0,
   pauseStart: 0,
@@ -240,6 +240,17 @@ async function route(msg) {
 
     /* ── 停止录制 ─────────────────────────────────────── */
     case 'STOP_RECORDING': {
+      if (state.status === 'preparing') {
+        if (state.mode === 'desktop' && state.recorderWindowId) {
+          try { await chrome.windows.remove(state.recorderWindowId); } catch (_) {}
+        }
+        setState({
+          status: 'idle', startTime: 0, recorderWindowId: 0, recorderTabId: 0,
+          processing: false, countdownRemaining: 0,
+        });
+        badge('idle');
+        return { ok: 1 };
+      }
       const finalizing = state.status === 'recording' || state.status === 'paused';
       // 发停止指令让引擎跑完 onStopped（保存文件）；
       // desktop 模式引擎保存完会自己关窗口，无需在这里直接 remove
@@ -420,12 +431,14 @@ async function route(msg) {
       }
       return { ok: 1 };
     case 'RECORDER_STARTED': {
-      setState({
-        status: 'recording',
-        startTime: Date.now(),
-        pausedTime: 0,
-      });
-      badge('recording');
+      if (state.status === 'preparing' || state.status === 'recording') {
+        setState({
+          status: 'recording',
+          startTime: Date.now(),
+          pausedTime: 0,
+        });
+        badge('recording');
+      }
       return { ok: 1 };
     }
     case 'FILE_SIZE_UPDATE':
@@ -562,13 +575,13 @@ async function openRecorderWindow(params, timeLimit) {
     mode: 'desktop',
     recorderWindowId: win.id,
     recorderTabId: tabId,
-    status: 'recording',
-    startTime: Date.now(),
+    status: 'preparing',
+    startTime: 0,
     pausedTime: 0,
     fileSize: 0,
     timeLimit: timeLimit || 0,
   });
-  badge('recording');
+  badge('preparing');
 
   return { ok: 1 };
 }
@@ -594,6 +607,7 @@ async function activeTab() {
 function badge(mode) {
   const m = {
     recording: { text: 'REC', color: '#ff4757' },
+    preparing: { text: 'WAIT', color: '#ffa502' },
     paused:    { text: '❚❚', color: '#ffa502' },
     saving:    { text: 'SAVE', color: '#ffa502' },
     error:     { text: '!',   color: '#ff4757' },
