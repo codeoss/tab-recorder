@@ -9,6 +9,8 @@
  *   3. 防静音回环：把劫持走的标签页音频接回 destination（可选）
  *   4. 倒计时（OFF_START 的 countdownSec 参数）
  *   5. onEvent：把状态/大小/历史通知回 background
+ *   6. saveFile：经 save-file.js 等待真实下载结果；OFF_RETRY_SAVE 只重试下载。
+ *      本上下文没有 UI，保存进度由 background 打开的 save-status.html 展示
  *
  * 关键点：
  *   - 跑在 offscreen document 内，popup 关闭、Chrome 最小化均不中断。
@@ -31,6 +33,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     OFF_PAUSE:   () => { engine && engine.pause();   return { ok: 1 }; },
     OFF_RESUME:  () => { engine && engine.resume();  return { ok: 1 }; },
     OFF_DISCARD: () => { startGen++; if (engine) engine.discard(); return { ok: 1 }; },
+    OFF_RETRY_SAVE: () => engine ? engine.retrySave() : Promise.resolve(false),
   };
   const fn = h[msg.type];
   if (!fn) return false;
@@ -74,6 +77,7 @@ async function doStart(opts) {
     },
     onEvent: (name, data) => onEvent(name, data),
     releaseExtra: () => releaseAudioCtx(),
+    saveFile: (blob, filename) => saveFileViaBackground(blob, filename),
   });
 
   const ok = await engine.start(opts);
@@ -107,11 +111,18 @@ async function getTabStream(opts) {
 
 function onEvent(name, data) {
   switch (name) {
-    case 'stopped':  notify('RECORDING_STOPPED', { historyEntry: data && data.historyEntry }); break;
+    case 'stopped':
+      notify('RECORDING_STOPPED', {
+        historyEntry: data && data.historyEntry,
+        discarded: !!(data && data.discarded),
+      });
+      break;
     case 'size':     notify('FILE_SIZE_UPDATE',  { size: data.bytes }); break;
     case 'processing':
-      // 上行给 background（state.processing），popup 据此显示「正在保存/转码…」
-      notify('ENGINE_PROCESSING', { active: !!(data && data.active) });
+      notify('ENGINE_PROCESSING', { active: !!(data && data.active), stage: data && data.stage });
+      break;
+    case 'saveerror':
+      notify('ENGINE_SAVE_ERROR', { message: data && data.message, canRetry: true });
       break;
     case 'tick':     /* offscreen 不显示计时，由 popup 自己算 */ break;
     case 'started':

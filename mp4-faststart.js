@@ -15,10 +15,12 @@
  * 做法：把 moov 移到第一个 mdat 之前（faststart 定义），moov 内 stco/co64
  * 表里的 chunk 绝对偏移统一 +moovSize（其后的 mdat 数据整体后移了这么多）。
  *
- * 适用边界：非分片的常规 MP4（Chrome MediaRecorder 输出即此类）。
- * 分片 MP4（moof/mfra）或 stco 32 位溢出时抛错，调用方自行回退。
+ * Scope: classic MP4 faststart and already-faststart fragmented MP4.
+ * For fMP4, only moov/moof headers are read; mvhd/tkhd/mdhd durations are
+ * rebuilt from fragment timelines while mdat and fragment boxes stay untouched.
+ * Fragmented files with moov at EOF and stco overflow still fall back.
  *
- * 暴露全局：mp4FaststartJs(blob) -> Promise<Blob>（已是 faststart 则原样返回）
+ * 暴露全局：mp4FaststartJs(blob) -> Promise<Blob>
  */
 
 (function (G) {
@@ -97,9 +99,202 @@
     return { patched, overflow };
   }
 
+  function childBoxes(dv, start, end) {
+    const out = [];
+    let cur = start;
+    while (cur < end) {
+      const h = boxHeader(dv, cur, end);
+      if (!h || h.size < h.headerLen || cur + h.size > end) {
+        throw new Error('MP4 box 截断或尺寸非法');
+      }
+      out.push({ ...h, off: cur, dataOff: cur + h.headerLen, end: cur + h.size });
+      cur += h.size;
+    }
+    return out;
+  }
+
+  function safeInteger(value) {
+    if (!Number.isSafeInteger(value)) throw new Error('MP4 时间值超出安全整数范围');
+    return value;
+  }
+
+  function readUint64(dv, off) {
+    const hi = dv.getUint32(off);
+    const lo = dv.getUint32(off + 4);
+    return safeInteger(hi * 4294967296 + lo);
+  }
+
+  function writeDuration(dv, off, version, value) {
+    safeInteger(value);
+    if (value < 0) throw new Error('MP4 时长不能为负数');
+    if (version === 1) {
+      dv.setBigUint64(off, BigInt(value));
+    } else {
+      if (value > 0xFFFFFFFF) throw new Error('MP4 version 0 时长溢出');
+      dv.setUint32(off, value);
+    }
+  }
+
+  function parseFmp4Moov(dv) {
+    const root = boxHeader(dv, 0, dv.byteLength);
+    if (!root) throw new Error('moov 头解析失败');
+    const top = childBoxes(dv, root.headerLen, dv.byteLength);
+    const mvhd = top.find(x => x.type === 'mvhd');
+    if (!mvhd) throw new Error('fMP4 缺 mvhd');
+    const mvVersion = dv.getUint8(mvhd.dataOff);
+    const movie = {
+      timescale: u32(dv, mvhd.dataOff + (mvVersion === 1 ? 20 : 12)),
+      durationOff: mvhd.dataOff + (mvVersion === 1 ? 24 : 16),
+      version: mvVersion,
+    };
+    if (!movie.timescale) throw new Error('MP4 电影 timescale 为 0');
+
+    const tracks = new Map();
+    for (const trak of top.filter(x => x.type === 'trak')) {
+      const children = childBoxes(dv, trak.dataOff, trak.end);
+      const tkhd = children.find(x => x.type === 'tkhd');
+      const mdia = children.find(x => x.type === 'mdia');
+      if (!tkhd || !mdia) throw new Error('fMP4 轨道缺 tkhd/mdia');
+      const mdhd = childBoxes(dv, mdia.dataOff, mdia.end).find(x => x.type === 'mdhd');
+      if (!mdhd) throw new Error('fMP4 轨道缺 mdhd');
+      const tkVersion = dv.getUint8(tkhd.dataOff);
+      const mdVersion = dv.getUint8(mdhd.dataOff);
+      const id = u32(dv, tkhd.dataOff + (tkVersion === 1 ? 20 : 12));
+      const track = {
+        id,
+        tkhdDurationOff: tkhd.dataOff + (tkVersion === 1 ? 28 : 20),
+        tkhdVersion: tkVersion,
+        mdhdDurationOff: mdhd.dataOff + (mdVersion === 1 ? 24 : 16),
+        mdhdVersion: mdVersion,
+        timescale: u32(dv, mdhd.dataOff + (mdVersion === 1 ? 20 : 12)),
+      };
+      if (!track.timescale) throw new Error('MP4 轨道 timescale 为 0');
+      tracks.set(id, track);
+    }
+    if (!tracks.size) throw new Error('fMP4 没有可修补的轨道');
+
+    const defaults = new Map();
+    for (const mvex of top.filter(x => x.type === 'mvex')) {
+      for (const trex of childBoxes(dv, mvex.dataOff, mvex.end).filter(x => x.type === 'trex')) {
+        defaults.set(u32(dv, trex.dataOff + 4), u32(dv, trex.dataOff + 12));
+      }
+    }
+    return { movie, tracks, defaults };
+  }
+
+  function parseTfhd(dv, box) {
+    const flags = u32(dv, box.dataOff) & 0xFFFFFF;
+    const trackId = u32(dv, box.dataOff + 4);
+    let pos = box.dataOff + 8;
+    if (flags & 0x000001) pos += 8;
+    if (flags & 0x000002) pos += 4;
+    let defaultDuration = 0;
+    if (flags & 0x000008) {
+      defaultDuration = u32(dv, pos);
+      pos += 4;
+    }
+    return { trackId, defaultDuration };
+  }
+
+  function parseTfdt(dv, box) {
+    const version = dv.getUint8(box.dataOff);
+    return version === 1 ? readUint64(dv, box.dataOff + 4) : u32(dv, box.dataOff + 4);
+  }
+
+  function parseTrun(dv, box, baseTime, defaultDuration) {
+    const version = dv.getUint8(box.dataOff);
+    const flags = u32(dv, box.dataOff) & 0xFFFFFF;
+    const count = u32(dv, box.dataOff + 4);
+    let pos = box.dataOff + 8;
+    if (flags & 0x000001) pos += 4;
+    if (flags & 0x000004) pos += 4;
+    let decodeTime = baseTime;
+    let maxEnd = 0;
+    for (let i = 0; i < count; i++) {
+      let duration = defaultDuration;
+      if (flags & 0x000100) {
+        duration = u32(dv, pos);
+        pos += 4;
+      }
+      if (flags & 0x000200) pos += 4;
+      if (flags & 0x000400) pos += 4;
+      let compositionOffset = 0;
+      if (flags & 0x000800) {
+        compositionOffset = version === 1 ? dv.getInt32(pos) : u32(dv, pos);
+        pos += 4;
+      }
+      if (!duration) throw new Error('MP4 trun 缺 sample duration 且没有默认值');
+      if (pos > box.end) throw new Error('MP4 trun 样本字段截断');
+      maxEnd = Math.max(maxEnd, decodeTime + compositionOffset + duration);
+      decodeTime += duration;
+      safeInteger(decodeTime);
+    }
+    return { maxEnd, decodeTime };
+  }
+
+  function parseMoof(dv, meta, ends) {
+    const root = boxHeader(dv, 0, dv.byteLength);
+    if (!root) throw new Error('moof 头解析失败');
+    for (const traf of childBoxes(dv, root.headerLen, dv.byteLength).filter(x => x.type === 'traf')) {
+      const children = childBoxes(dv, traf.dataOff, traf.end);
+      const tfhd = children.find(x => x.type === 'tfhd');
+      const tfdt = children.find(x => x.type === 'tfdt');
+      if (!tfhd || !tfdt) throw new Error('MP4 traf 缺 tfhd/tfdt');
+      const { trackId, defaultDuration } = parseTfhd(dv, tfhd);
+      if (!meta.tracks.has(trackId)) throw new Error('MP4 分片包含未知轨道');
+      const baseTime = parseTfdt(dv, tfdt);
+      const fallback = defaultDuration || meta.defaults.get(trackId) || 0;
+      let decodeTime = baseTime;
+      for (const trun of children.filter(x => x.type === 'trun')) {
+        const result = parseTrun(dv, trun, decodeTime, fallback);
+        decodeTime = result.decodeTime;
+        ends.set(trackId, Math.max(ends.get(trackId) || 0, result.maxEnd));
+      }
+    }
+  }
+
+  function rescaleTime(value, fromScale, toScale) {
+    const scaled = value * toScale;
+    safeInteger(scaled);
+    return Math.round(scaled / fromScale);
+  }
+
+  async function fixFragmentedMp4(blob, boxes, moov) {
+    const total = blob.size;
+    const moofs = boxes.filter(x => x.type === 'moof');
+    const moovBuf = await blob.slice(moov.off, moov.off + moov.size).arrayBuffer();
+    const dv = new DataView(moovBuf);
+    const meta = parseFmp4Moov(dv);
+    const ends = new Map();
+
+    for (const moof of moofs) {
+      if (moof.off + moof.size > total) throw new Error('MP4 moof 截断');
+      const buf = await blob.slice(moof.off, moof.off + moof.size).arrayBuffer();
+      parseMoof(new DataView(buf), meta, ends);
+    }
+
+    let movieDuration = 0;
+    for (const [trackId, track] of meta.tracks) {
+      if (!ends.has(trackId)) throw new Error(`MP4 轨道 ${trackId} 没有可计算的媒体时长`);
+      const end = ends.get(trackId);
+      const inMovieScale = rescaleTime(end, track.timescale, meta.movie.timescale);
+      movieDuration = Math.max(movieDuration, inMovieScale);
+      writeDuration(dv, track.tkhdDurationOff, track.tkhdVersion, inMovieScale);
+      writeDuration(dv, track.mdhdDurationOff, track.mdhdVersion, end);
+    }
+    writeDuration(dv, meta.movie.durationOff, meta.movie.version, movieDuration);
+
+    return new Blob([
+      blob.slice(0, moov.off),
+      new Uint8Array(moovBuf),
+      blob.slice(moov.off + moov.size),
+    ], { type: blob.type || 'video/mp4' });
+  }
+
   /**
    * @param {Blob} blob  Chrome MediaRecorder 原生录的 MP4（moov 通常在末尾）
-   * @returns {Promise<Blob>}  moov 已在 mdat 之前的 MP4；已是 faststart 则原样返回
+   * @returns {Promise<Blob>} faststart MP4 with valid duration metadata;
+   *   non-fragmented faststart input is returned unchanged
    * @throws  非常规 MP4（无 moov/mdat、无 chunk 表、32 位偏移溢出）时抛错
    */
   async function mp4FaststartJs(blob) {
@@ -124,7 +319,10 @@
     const moov = boxes.find(b => b.type === 'moov');
     const mdat = boxes.find(b => b.type === 'mdat');
     if (!moov || !mdat) throw new Error('未找到 moov/mdat，不是常规 MP4');
-    if (moov.off < mdat.off) return blob;   // 已是 faststart，无需处理
+    if (moov.off < mdat.off) {
+      if (boxes.some(b => b.type === 'moof')) return await fixFragmentedMp4(blob, boxes, moov);
+      return blob;   // 已是 faststart 且非分片，无需处理
+    }
 
     // 2. 读入 moov 全量（KB~MB 级），chunk 偏移统一 +moov.size
     //    （moov 插到第一个 mdat 之前，其后所有数据整体右移 moov.size 字节）

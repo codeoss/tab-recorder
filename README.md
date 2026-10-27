@@ -17,10 +17,11 @@
 | 📐 分辨率/帧率/比特率 | 480p / 720p / 1080p / 1440p / 4K；15/24/30/60 fps；4/8/16 Mbps |
 | ⏱️ 倒计时 | 录制前可选 3/5/10 秒倒计时 |
 | ⏸️ 暂停 / 恢复 / 丢弃 | 录制中可暂停、恢复或丢弃 |
-| 🎬 WebM 输出 | 原生 `MediaRecorder`，并修复 EBML 索引使其可拖动进度条 |
+| 🎬 WebM 输出 | 原生 `MediaRecorder`，补 SeekHead/Cues/Duration，Chrome 与 Windows 媒体播放器均可拖动 |
 | 📦 可选 MP4 输出 | 新版 Chrome 原生录制（编码随平台：Win/macOS 为 H.264/AAC，Linux 为 VP9/Opus-in-MP4）；老版本用 ffmpeg.wasm 转码 |
+| 💾 保存状态可见 | 整理/转码/下载各阶段清晰可见；真实下载完成后才显示已保存，失败可重试或明确丢弃 |
 | ☁️ 云桌面兼容模式 | RDP/云桌面下 tabCapture 音频劫持失效时的兜底方案 |
-| 📜 历史记录 | 最近 5 次录制展示在弹窗 |
+| 📜 历史记录 | 最近 5 次录制展示在弹窗，且只在下载完成后写入 |
 
 ---
 
@@ -28,15 +29,19 @@
 
 ```
 tab-recorder-ext/
-├── manifest.json         # MV3 清单
-├── background.js         # service worker：状态机 + 消息路由 + getMediaStreamId + offscreen 管理
+├── manifest.json         # MV3 清单（含 downloads 权限）
+├── background.js         # service worker：状态机 + 消息路由 + 下载结果对账 + 保存窗口管理
 ├── offscreen.html        # 标签页录制引擎宿主（无 UI）
 ├── offscreen.js          # tab 录制：getUserMedia(tab) + 音频回环 + MediaRecorder
 ├── recorder.html         # 窗口/屏幕/兼容模式录制窗口 UI
-├── recorder.js           # getDisplayMedia + 兼容模式 + MediaRecorder
+├── recorder.js           # getDisplayMedia + 兼容模式 + 保存状态与关窗保护
+├── save-status.html/js   # 标签页专用可见保存窗口（进度、完成、失败重试）
+├── save-file.js          # Blob URL 适配器：交给 background 下载并等待真实终态
+├── core-recorder.js      # 公共录制引擎：录制、修复、等待下载完成、失败重试
 ├── popup.html            # 主弹窗 UI
 ├── popup.js              # UI 控制器 + 状态轮询
-├── fix-webm.js           # EBML 修复（补 Cues/Duration，使 WebM 可拖动）
+├── fix-webm.js           # EBML 修复（补 SeekHead/Cues/Duration）
+├── mp4-faststart.js      # 常规 MP4 faststart + fMP4 时长重建（只读 moov/moof）
 ├── transcoder.js         # ffmpeg.wasm 主线程入口：webmToMp4(blob) / mp4Faststart(blob)
 ├── transcoder-worker.js  # Web Worker 宿主：在独立线程跑 ffmpeg，主线程不阻塞
 ├── icons/{16,48,128}.png
@@ -61,7 +66,7 @@ tab-recorder-ext/
 3. 按需设置分辨率、帧率、比特率、定时停止、输出格式
 4. 点红色录制按钮 →（倒计时后）开始
 5. **此时可关闭弹窗、可最小化 Chrome，录制继续**
-6. 停止后文件自动下载到默认下载目录
+6. 停止后等待保存完成，文件自动下载到默认下载目录
 
 ### 最小化不中断的原理
 
@@ -72,6 +77,16 @@ tab-recorder-ext/
 
 `tabCapture` 会把标签页音频「劫持」走，导致录制时用户听不到声音。本扩展用 `AudioContext` 把音频接到扬声器做回环，勾选「录制时保持标签页声音」即可在录制时继续听到。
 
+### 💾 保存状态与防误关
+
+- **标签页模式**：停止后自动打开「保存状态」窗口；主弹窗关闭也不会影响保存。手动关闭进度窗口后，可从主弹窗的「打开保存进度」重新打开。
+- **窗口/屏幕/兼容模式**：保存阶段继续显示在原 recorder 窗口中。
+- 状态依次包括整理/修复、可选转码、下载落盘、保存完成。**只有 Chrome 下载真正完成（`complete`）后才显示“已保存”并写入历史**；开始下载不等于保存完成。
+- 下载期间显示真实接收字节数和百分比（总大小未知时显示不确定状态），不会伪造进度。
+- **请在显示保存完成前不要关闭浏览器**。保存窗口和 recorder 窗口会在未完成时尝试用 `beforeunload` 提醒，但强制退出、系统关机或浏览器崩溃无法被扩展绝对阻止，仍可能丢失尚未落盘的数据。
+- 下载失败时，若最终 Blob 仍在内存，会显示「重试保存」和「丢弃这次录制」；重试只重新下载，不重新修复或转码。若保存上下文已关闭，则明确提示无法重试，不会提供假恢复。
+- 保存/下载及可重试失败期间不能开始新录制；成功或明确丢弃后恢复。
+
 ---
 
 ## 📦 可选：启用 MP4 输出
@@ -80,13 +95,14 @@ tab-recorder-ext/
 
 | 环境 | 行为 | 产物 |
 |---|---|---|
-| 新版 Chrome（原生支持 MP4 录制） | 原生录制，结束后用内置纯 JS（`mp4-faststart.js`）搬 moov 到文件头，内存占用与文件大小无关，长视频也适用 | 可拖动的 `.mp4`，**无需内核** |
+| 新版 Chrome（原生支持 MP4 录制） | 原生录制，结束后用内置纯 JS 做 faststart，并为分片 MP4 重建 `mvhd/tkhd/mdhd` 真实时长；只读 `moov/moof`，内存占用与文件大小无关 | Windows 媒体播放器可拖动的 `.mp4`，**无需内核** |
 | 新版 Chrome 但 JS faststart 不适用（非常规 MP4） | 用 ffmpeg 内核做 faststart 兜底 | 可拖动的 `.mp4` |
 | 老版本 Chrome（无原生 MP4） | 先录 WebM，结束后用 ffmpeg 内核转码（慢，长视频可达数十分钟） | 可拖动的 `.mp4`；无内核或转码失败回退 `.webm` |
 
-> **PotPlayer 打开 MP4 很慢？** 中间版本的 Chrome 原生 MP4 是分片式（fMP4）且不带 mfra 索引，PotPlayer 等弱 fMP4 播放器要逐分片扫描才能建索引，大文件打开很慢。用 ffmpeg 重封装一次即可（流复制，不重编码，秒级）：
+WebM 保存时也会补规范的 `SeekHead`，使 Windows Media Foundation 能发现已有的 `Cues` 索引；不是仅让 Chrome 可拖。
+
+> **PotPlayer 打开 MP4 很慢？** 不同 Chrome 版本的分片布局和 mfra 情况不同。扩展已补齐 fMP4 时长，但弱 fMP4 播放器仍可能因逐分片建索引而打开较慢，可用 ffmpeg 重封装改善（流复制，不重编码）：
 > `ffmpeg -i 录制的.mp4 -c copy -movflags +faststart 修复后.mp4`
-> Chrome ≥153 的产物自带 mfra，无此问题；VLC / mpv 也不受影响。
 
 可见：新版 Chrome 下 MP4 开箱即用（原生录制 + 内置 JS faststart）；**ffmpeg 内核只用于**老版 Chrome 的整段转码、以及非常规 MP4 的 faststart 兜底。内核体积较大（约 30MB）且为 GPL-2.0-or-later 许可（内含 libx264），故未随扩展打包。两种放入方式任选其一：
 
@@ -134,7 +150,8 @@ npm i @ffmpeg/core@0.12.10
 | `tabCapture` | 录制标签页画面与声音 |
 | `activeTab` | 获取当前活动标签页（不枚举任意标签） |
 | `offscreen` | 创建 offscreen document 承载录制引擎 |
-| `storage` | 保存设置与历史记录 |
+| `storage` | 保存设置、历史记录及保存状态 |
+| `downloads` | 启动下载并监听真实完成/中断状态，完成前不报告已保存 |
 
 **无 host_permissions，无 `tabs` 权限，完全离线。**
 
@@ -143,7 +160,12 @@ npm i @ffmpeg/core@0.12.10
 ## 🧪 验证清单
 
 - [ ] 标签页录制 + 最小化 Chrome 30s → 文件正常且可拖动进度
+- [ ] WebM 与原生 MP4 均能在 Windows 媒体播放器前/中/后段拖动
 - [ ] 定时停止 10s → 到点自动保存
+- [ ] 停止后立即关闭主弹窗，独立保存窗口仍显示进度；可手动重开
+- [ ] 保存期间不出现提前“已保存”，下载完成后才写历史
+- [ ] 模拟一次下载失败 → 重试成功；另一次明确丢弃 → 无历史且可重新录制
+- [ ] 桌面 recorder 最小化后停止 → 保存状态与完成提示正常
 - [ ] 切换分辨率 1280×720 → 输出分辨率正确
 - [ ] 窗口模式选择某窗口录制成功
 - [ ] 勾选 MP4 输出（放入 ffmpeg 内核后）得到 `.mp4`
@@ -155,7 +177,10 @@ npm i @ffmpeg/core@0.12.10
 
 - **MV3 + offscreen document**：规避 service worker 被回收导致的录制中断
 - **`getMediaStreamId` 跨上下文传递**：worker 取 streamId，offscreen 消费
-- **EBML 修复（`fix-webm.js`）**：手写 EBML 解析器重建 `Cues` 索引、修补 `Duration`，纯 JS 无依赖；流式实现（滑窗扫描 + Blob.slice 拼装），内存与文件大小无关，GB 级长视频不放大内存
+- **EBML 修复（`fix-webm.js`）**：手写 EBML 解析器补 `SeekHead`、重建 `Cues`、修补 `Duration`；滑窗扫描 + Blob.slice 拼装，内存与文件大小无关
+- **fMP4 时长重建（`mp4-faststart.js`）**：只读取 `moov/moof`，从 `tfhd/tfdt/trun/trex` 计算真实轨道时长，不读取完整 `mdat`
+- **下载结果确认**：`save-file.js` 创建 Blob URL，background 用 `chrome.downloads` 启动并对账；offscreen 不直接调用不受支持的 downloads API
+- **可见保存状态**：标签页有独立保存窗口，桌面复用 recorder；保存失败保留最终 Blob 供重试，成功或明确丢弃前维持关窗保护
 - **分片压缩**：每 60s 合并一次 `chunks`，防止长时间录制内存膨胀
 - **Track `ended` 监听**：用户点 Chrome「停止共享」条时干净收尾
 

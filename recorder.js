@@ -36,6 +36,9 @@ const stxt        = document.getElementById('stxt');
 const sizeInfo    = document.getElementById('sizeInfo');
 const pauseBtn    = document.getElementById('pauseBtn');
 const stopBtn     = document.getElementById('stopBtn');
+const saveProgress = document.getElementById('saveProgress');
+const retrySaveBtn = document.getElementById('retrySaveBtn');
+const discardSaveBtn = document.getElementById('discardSaveBtn');
 
 /* ── 解析 URL hash 配置 ─────────────────────────────── */
 
@@ -75,6 +78,19 @@ pauseBtn.addEventListener('click', () => {
   else engine.pause();
 });
 stopBtn.addEventListener('click',  () => engine && engine.stop());
+retrySaveBtn.addEventListener('click', async () => {
+  if (!engine) return;
+  retrySaveBtn.disabled = true;
+  discardSaveBtn.disabled = true;
+  try { await engine.retrySave(); }
+  finally {
+    retrySaveBtn.disabled = false;
+    discardSaveBtn.disabled = false;
+  }
+});
+discardSaveBtn.addEventListener('click', () => {
+  if (engine && confirm('确定丢弃此次录制？此操作不可恢复。')) engine.discard();
+});
 
 /* ── 接收来自 background 的指令（popup 操作转发过来）─────────
    desktop 模式下 popup 操作原本到不了这个窗口，这条通道补齐了
@@ -83,6 +99,10 @@ stopBtn.addEventListener('click',  () => engine && engine.stop());
    ────────────────────────────────────────────────────────── */
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (!engine) return false;
+  if (msg.type === 'OFF_RETRY_SAVE') {
+    engine.retrySave().then(ok => reply({ ok: ok ? 1 : 0 })).catch(e => reply({ error: e.message }));
+    return true;
+  }
   const h = {
     OFF_STOP:    () => { engine.stop();    return { ok: 1 }; },
     OFF_PAUSE:   () => { engine.pause();   return { ok: 1 }; },
@@ -116,6 +136,7 @@ async function startRecording() {
     getStream: () => getCaptureStream(),
     onEvent:   (name, data) => onEvent(name, data),
     releaseExtra: () => releaseExtraStreams(),
+    saveFile: (blob, filename) => saveFileViaBackground(blob, filename),
   });
 
   const ok = await engine.start({
@@ -262,17 +283,46 @@ function onEvent(name, data) {
       notifyBg('FILE_SIZE_UPDATE', { size: data.bytes });
       break;
 
-    case 'processing':
-      // 转码/保存期间提示用户不要关窗，并上行给 background（popup 也会显示）
+    case 'processing': {
+      const stages = {
+        'webm-fix': '正在整理 WebM 索引',
+        'mp4-fix': '正在修复 MP4 时长与索引',
+        transcode: '正在转码',
+        download: '正在保存到下载目录',
+      };
       if (data.active) {
-        stxt.textContent = '处理中...（转码中请勿关闭窗口）';
+        stxt.textContent = stages[data.stage] || '正在整理视频';
+        saveProgress.textContent = '完成前请勿关闭浏览器';
+        pauseBtn.disabled = true;
+        stopBtn.disabled = true;
+        retrySaveBtn.hidden = true;
+        discardSaveBtn.hidden = true;
         dot.style.animation = 'none';
+      } else {
+        pauseBtn.disabled = false;
+        stopBtn.disabled = false;
       }
-      notifyBg('ENGINE_PROCESSING', { active: !!data.active });
+      notifyBg('ENGINE_PROCESSING', { active: !!data.active, stage: data.stage });
+      break;
+    }
+
+    case 'saveerror':
+      stxt.textContent = '保存失败：' + (data && data.message) + '，文件仍在内存';
+      saveProgress.textContent = '可重试保存，或明确选择丢弃';
+      retrySaveBtn.hidden = false;
+      discardSaveBtn.hidden = false;
+      retrySaveBtn.disabled = false;
+      discardSaveBtn.disabled = false;
+      notifyBg('ENGINE_SAVE_ERROR', { message: data && data.message, canRetry: true });
       break;
 
     case 'stopped':
-      notifyBg('RECORDER_STOPPED', { historyEntry: data && data.historyEntry });
+      retrySaveBtn.hidden = true;
+      discardSaveBtn.hidden = true;
+      notifyBg('RECORDER_STOPPED', {
+        historyEntry: data && data.historyEntry,
+        discarded: !!(data && data.discarded),
+      });
       if (data && data.historyEntry) {
         // 正常停止：等 saved 事件再关窗
       } else {
@@ -282,11 +332,29 @@ function onEvent(name, data) {
       break;
 
     case 'saved':
+      retrySaveBtn.hidden = true;
+      discardSaveBtn.hidden = true;
+      saveProgress.textContent = '';
       stxt.textContent = '已保存: ' + data.filename;
       setTimeout(() => window.close(), 2000);
       break;
   }
 }
+
+async function pollSaveState() {
+  if (!engine || !engine.isBusy()) return;
+  try {
+    const bg = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+    if (!bg) return;
+    if (bg.savePhase === 'downloading' && bg.saveTotal > 0) {
+      const percent = Math.min(100, Math.floor(bg.saveReceived / bg.saveTotal * 100));
+      saveProgress.textContent = `${percent}% · ${(bg.saveReceived / 1048576).toFixed(1)} / ${(bg.saveTotal / 1048576).toFixed(1)} MB`;
+    } else if (bg.savePhase === 'error' && bg.saveCanRetry) {
+      saveProgress.textContent = '文件仍在内存，可重试或明确丢弃';
+    }
+  } catch (_) {}
+}
+setInterval(pollSaveState, 1000);
 
 /* ── 辅助 ────────────────────────────────────────────── */
 

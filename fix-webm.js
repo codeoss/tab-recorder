@@ -4,13 +4,14 @@
  * Chrome's MediaRecorder outputs WebM files that:
  *   1) Have Duration = 0 or absent  → player shows "unknown length"
  *   2) Have NO Cues element         → player CANNOT seek/drag progress bar
+ *   3) Have NO SeekHead             → Windows Media Foundation cannot discover Cues
  *
- * This module fixes BOTH by:
+ * This module fixes all three by:
  *   1) Scanning all Cluster elements to read their Timecodes + byte offsets
- *   2) Building a proper Cues element (seek index)
- *   3) Appending Cues at the end of the file
+ *   2) Building a proper Cues element (seek index) and appending it at EOF
+ *   3) Inserting a fixed-size SeekHead whose positions are relative to Segment data
  *   4) Patching Duration in the Info element — or INSERTING one when Chrome
- *      never wrote it (Info grows; cluster offsets in Cues shift accordingly)
+ *      never wrote it (all head insertions are included in Cue/Seek positions)
  *
  * All of the above is STREAMING: the file is never fully materialized.
  * A 256KB sliding window scans sequentially (fixWebMStream), and the output
@@ -132,6 +133,17 @@
     return new Uint8Array(bytes);
   }
 
+  /** Fixed-width positions keep SeekHead's size independent of the file layout. */
+  function encodeUintFixed(value, width) {
+    const bytes = new Uint8Array(width);
+    let v = value;
+    for (let i = width - 1; i >= 0; i--) {
+      bytes[i] = v & 0xFF;
+      v = Math.floor(v / 256);
+    }
+    return bytes;
+  }
+
   /** Encode an EBML element: ID bytes + VINT size + data. */
   function encodeElement(idBytes, data) {
     const id = new Uint8Array(idBytes);
@@ -178,6 +190,12 @@
 
   // Byte representations for writing
   const ID_BYTES = {
+    INFO:          [0x15, 0x49, 0xA9, 0x66],
+    TRACKS:        [0x16, 0x54, 0xAE, 0x6B],
+    SEEKHEAD:      [0x11, 0x4D, 0x9B, 0x74],
+    SEEK:          [0x4D, 0xBB],
+    SEEKID:        [0x53, 0xAB],
+    SEEKPOS:       [0x53, 0xAC],
     CUES:          [0x1C, 0x53, 0xBB, 0x6B],
     CUE_POINT:     [0xBB],
     CUE_TIME:      [0xB3],
@@ -186,6 +204,20 @@
     CUE_CLUSTER:   [0xF1],
     DURATION:      [0x44, 0x89],
   };
+
+  function buildSeekHead(infoRel, tracksRel, cuesRel) {
+    function entry(idBytes, position) {
+      return encodeElement(ID_BYTES.SEEK, concat(
+        encodeElement(ID_BYTES.SEEKID, new Uint8Array(idBytes)),
+        encodeElement(ID_BYTES.SEEKPOS, encodeUintFixed(position, 8)),
+      ));
+    }
+    return encodeElement(ID_BYTES.SEEKHEAD, concat(
+      entry(ID_BYTES.INFO, infoRel),
+      entry(ID_BYTES.TRACKS, tracksRel),
+      entry(ID_BYTES.CUES, cuesRel),
+    ));
+  }
 
   /* ═══════════════════════════════════════════════════════
      LEGACY full-buffer implementation — golden reference only.
@@ -223,6 +255,7 @@
 
     /* ── Step 3: Scan Segment children ── */
     let infoOff = -1, infoLen = 0;    // Info element (header + data)
+    let tracksOff = -1;               // Tracks element offset for SeekHead
     let infoSzOff = 0, infoSzLen = 0; // where Info's size VINT is, and its width
     let infoDataStart = 0;            // Info data begin
     let infoDataEnd = -1;             // Info data end (-1 if unknown size)
@@ -262,6 +295,8 @@
       const elSz = readSize(dv, szOff);
       if (!elSz) break;
       const dataOff = szOff + elSz.len;
+
+      if (elId.id === ID.TRACKS) tracksOff = cur;
 
       if (elId.id === ID.INFO && !infoSeen) {
         // Only trust the FIRST Info, and only if it parses cleanly (well-formed
@@ -387,64 +422,68 @@
       for (const c of clusters) { c.relativeOff += insertLen; c.absoluteOff += insertLen; }
     }
 
-    /* ── Step 5: Build Cues element (offsets must be final by now) ── */
-    const cuesData = buildCues(clusters);
+    if (infoOff < 0 || tracksOff < 0) return buf;
 
-    /* ── Step 6: Build new file ── */
-    let newBuf;
+    /* ── Step 5: Build Cues and a fixed-size SeekHead ── */
+    const seekHeadLen = buildSeekHead(0, 0, 0).byteLength;
+    const contentDelta = insertLen + seekHeadLen;
+    const cuesData = buildCues(clusters.map(c => ({
+      relativeOff: c.relativeOff + seekHeadLen,
+      timecodeMs: c.timecodeMs,
+    })));
+    const seekHeadData = buildSeekHead(
+      infoOff - segDataStart + seekHeadLen,
+      tracksOff - segDataStart + contentDelta,
+      total - segDataStart + contentDelta,
+    );
+
+    /* ── Step 6: Update Segment size, widening its VINT when required ── */
+    let newSegVint = null;
+    let segSizeDelta = 0;
+    if (!segSz.unknown) {
+      const newSegSize = segSz.val + contentDelta + cuesData.byteLength;
+      let newSegSzLen = segSzLen;
+      while (newSegSize > Math.pow(2, 7 * newSegSzLen) - 2) newSegSzLen++;
+      newSegVint = encodeVintSizeFixed(newSegSize, newSegSzLen);
+      segSizeDelta = newSegSzLen - segSzLen;
+    }
+
+    /* ── Step 7: Assemble [Segment header][SeekHead][Info..media][Cues] ── */
+    const parts = [];
+    if (newSegVint) {
+      parts.push(
+        new Uint8Array(buf, 0, segSzOff),
+        newSegVint,
+        new Uint8Array(buf, segSzOff + segSzLen, segDataStart - (segSzOff + segSzLen)),
+      );
+    } else {
+      parts.push(new Uint8Array(buf, 0, segDataStart));
+    }
+    parts.push(seekHeadData);
     if (insertLen > 0) {
-      // [.. Info size VINT) + new VINT + Info data + Duration + rest + Cues
-      newBuf = concat(
-        new Uint8Array(buf, 0, infoSzOff),
+      parts.push(
+        new Uint8Array(buf, segDataStart, infoSzOff - segDataStart),
         newInfoVint,
         new Uint8Array(buf, infoSzOff + infoSzLen, infoDataEnd - (infoSzOff + infoSzLen)),
         durEl,
         new Uint8Array(buf, infoDataEnd, total - infoDataEnd),
-        cuesData,
       );
     } else {
-      const origBytes = new Uint8Array(buf);
-      newBuf = new Uint8Array(total + cuesData.byteLength);
-      newBuf.set(origBytes, 0);
-      newBuf.set(cuesData, total);
+      parts.push(new Uint8Array(buf, segDataStart, total - segDataStart));
     }
+    parts.push(cuesData);
+    const newBuf = concat(...parts);
 
-    /* ── Step 7: Patch Duration in place when Chrome wrote one ── */
+    /* ── Step 8: Patch Duration after the two possible head shifts ── */
     const newDv = new DataView(newBuf.buffer);
+    const durationOff = durationDataOff + segSizeDelta + seekHeadLen;
     if (durationDataOff >= 0 && durationDataLen === 8) {
-      newDv.setFloat64(durationDataOff, durVal);
+      newDv.setFloat64(durationOff, durVal);
     } else if (durationDataOff >= 0 && durationDataLen === 4) {
-      newDv.setFloat32(durationDataOff, durVal);
-    }
-
-    /* ── Step 8: Update Segment size if it was fixed (not unknown) ── */
-    if (!segSz.unknown) {
-      const newSegSize = segSz.val + cuesData.byteLength + insertLen;
-      // An n-byte VINT size field carries 7n payload bits, and all-ones is
-      // reserved for "unknown size". If the new size exceeds the field's
-      // capacity, writing it in place would silently truncate and corrupt
-      // the file — skip the update instead (players can still scan to the
-      // end; Chrome's MediaRecorder output normally uses unknown size and
-      // never reaches this branch).
-      const capacity = Math.pow(2, 7 * segSzLen) - 2;
-      if (newSegSize <= capacity) {
-        writeVintSize(newDv, segSzOff, segSzLen, newSegSize);
-      }
+      newDv.setFloat32(durationOff, durVal);
     }
 
     return newBuf.buffer;
-  }
-
-  /** Overwrite a VINT size field in place (same byte width). */
-  function writeVintSize(dv, off, width, value) {
-    const bytes = [];
-    let v = value;
-    for (let i = width - 1; i >= 0; i--) {
-      bytes[i] = v & 0xFF;
-      v = Math.floor(v / 256);
-    }
-    bytes[0] = (bytes[0] & ((1 << (8 - width)) - 1)) | (1 << (8 - width));
-    for (let i = 0; i < width; i++) dv.setUint8(off + i, bytes[i]);
   }
 
   /* ═══════════════════════════════════════════════════════
@@ -609,6 +648,7 @@
     const f = {
       segSzOff, segSzLen, segSzVal: segSz.val, segSzUnknown: segSz.unknown,
       segDataStart,
+      infoOff: -1, tracksOff: -1,
       infoSzOff: 0, infoSzLen: 0, infoDefinite: false, infoDataStart: 0, infoDataEnd: -1,
       durationDataOff: -1, durationDataLen: 0,
       timecodeScale: 1000000,
@@ -645,6 +685,8 @@
       if (!elSz) break;
       const dataOff = szOff + elSz.len;
 
+      if (elId.id === ID.TRACKS) f.tracksOff = cur;
+
       if (elId.id === ID.INFO && !infoSeen) {
         // 只采信第一个 Info，且必须「解析干净」：子元素全部合法、恰好占满、
         // 含 TimecodeScale。Cluster 负载里的同字节幻影（1549A966 出现在媒体
@@ -670,6 +712,7 @@
           ic = cData + cSz.val;
         }
         if (clean && sawScale && ic === infoEnd) {
+          f.infoOff = cur;
           f.infoSzOff = iSzOff; f.infoSzLen = iSzLen;
           f.infoDefinite = true; f.infoDataStart = dataOff; f.infoDataEnd = infoEnd;
           f.durationDataOff = durOff; f.durationDataLen = durLen;
@@ -745,21 +788,29 @@
       edits.push({ off: f.durationDataOff, deleteLen: f.durationDataLen, insert: b });
     }
 
-    /* 编辑 2：Cues。cluster 相对偏移先按头部编辑的净增量右移
-       （编辑点都在 Info 一带，位于所有 Cluster 之前） */
-    const headDelta = edits.reduce((s, e) => s + e.insert.byteLength - e.deleteLen, 0);
+    if (f.infoOff < 0 || f.tracksOff < 0) return blob;
+
+    /* 编辑 2：固定长度 SeekHead + Cues；相对偏移不含 Segment size 字段加宽量 */
+    const durationDelta = edits.reduce((s, e) => s + e.insert.byteLength - e.deleteLen, 0);
+    const seekHeadLen = buildSeekHead(0, 0, 0).byteLength;
+    const contentDelta = durationDelta + seekHeadLen;
     const cuesData = buildCues(f.clusters.map(c => ({
-      relativeOff: c.absoluteOff - f.segDataStart + headDelta,
+      relativeOff: c.absoluteOff - f.segDataStart + contentDelta,
       timecodeMs: c.timecodeMs,
     })));
+    const seekHeadData = buildSeekHead(
+      f.infoOff - f.segDataStart + seekHeadLen,
+      f.tracksOff - f.segDataStart + contentDelta,
+      total - f.segDataStart + contentDelta,
+    );
+    edits.push({ off: f.segDataStart, deleteLen: 0, insert: seekHeadData });
 
-    /* 编辑 3：Segment size（定长时原宽重写；容量不够则跳过，宁可不动不写坏） */
+    /* 编辑 3：定长 Segment 更新 size；容量不足时加宽 VINT 而不是保留错误尺寸 */
     if (!f.segSzUnknown) {
-      const newSegSize = f.segSzVal + cuesData.byteLength + headDelta;
-      const capacity = Math.pow(2, 7 * f.segSzLen) - 2;
-      if (newSegSize <= capacity) {
-        edits.push({ off: f.segSzOff, deleteLen: f.segSzLen, insert: encodeVintSizeFixed(newSegSize, f.segSzLen) });
-      }
+      const newSegSize = f.segSzVal + contentDelta + cuesData.byteLength;
+      let newSegSzLen = f.segSzLen;
+      while (newSegSize > Math.pow(2, 7 * newSegSzLen) - 2) newSegSzLen++;
+      edits.push({ off: f.segSzOff, deleteLen: f.segSzLen, insert: encodeVintSizeFixed(newSegSize, newSegSzLen) });
     }
 
     /* 编辑 4：Cues 追加到文件尾 */

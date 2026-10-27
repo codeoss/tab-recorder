@@ -6,6 +6,8 @@
  *   2. 消息路由：把 popup 的指令分发给 offscreen / recorder 窗口
  *   3. 通过 chrome.tabCapture.getMediaStreamId 取得 streamId 并跨上下文传递
  *   4. 管理录制窗口生命周期与历史记录
+ *   5. 通过 chrome.downloads 确认真实落盘，维护保存阶段、进度和失败重试状态；
+ *      tab 停止后打开 save-status.html，避免 popup 关闭后用户看不到保存进度
  *
  * 为什么 service worker 不直接录制？
  *   - MV3 worker 会被系统回收，无法长时间持有 MediaRecorder。
@@ -25,7 +27,17 @@ const state = {
   recorderWindowId: 0,
   recorderTabId: 0,        // desktop 模式 recorder 窗口里的 tab id（用于转发指令）
   countdownRemaining: 0,
-  processing: false,       // 引擎正在保存/转码（onStopped 异步链进行中）
+  processing: false,       // 引擎正在保存/转码/等待下载结果（含失败待处理）
+  savePhase: '',           // '' | processing | downloading | complete | error
+  processingStage: '',     // webm-fix | mp4-fix | transcode | download
+  downloadId: 0,
+  saveError: '',
+  saveFilename: '',
+  saveWindowId: 0,
+  saveCanRetry: false,
+  saveReceived: 0,
+  saveTotal: 0,
+  saveGeneration: 0,        // 新录制/重试递增，防止旧异步结果提交到新任务
 };
 
 /* ═══════════════════════════════════════════════════════
@@ -46,6 +58,14 @@ function setState(patch) {
   chrome.storage.session.set({ [STATE_KEY]: state }).catch(() => {});
 }
 
+function resetSaveResult() {
+  setState({
+    savePhase: '', processingStage: '', downloadId: 0,
+    saveError: '', saveFilename: '', saveWindowId: 0,
+    saveCanRetry: false, saveReceived: 0, saveTotal: 0,
+  });
+}
+
 /** SW 启动时异步恢复 state；返回 Promise。 */
 function restoreState() {
   return chrome.storage.session.get(STATE_KEY).then(d => {
@@ -57,6 +77,48 @@ function restoreState() {
 
 // 顶层立即发起恢复；route() 会 await 它
 const stateReady = restoreState();
+
+function downloadBasename(path) {
+  return (path || '').replace(/\\/g, '/').split('/').pop() || '';
+}
+
+async function refreshDownloadStatus(downloadId) {
+  if (!downloadId || downloadId !== state.downloadId) return { error: '下载任务不存在或已过期' };
+  const generation = state.saveGeneration;
+  const [item] = await chrome.downloads.search({ id: downloadId });
+  if (generation !== state.saveGeneration || downloadId !== state.downloadId) {
+    return { error: '下载任务已替换，忽略过期结果' };
+  }
+  if (!item) {
+    setState({ savePhase: 'error', saveError: 'DOWNLOAD_NOT_FOUND' });
+    return { state: 'interrupted', error: 'DOWNLOAD_NOT_FOUND', filename: state.saveFilename, path: '', received: 0, total: 0 };
+  }
+  const currentState = item.state || 'interrupted';
+  const received = item.bytesReceived || 0;
+  const total = item.totalBytes > 0 ? item.totalBytes : 0;
+  const filename = downloadBasename(item.filename) || state.saveFilename;
+  setState({
+    savePhase: currentState === 'complete' ? 'complete' : currentState === 'interrupted' ? 'error' : 'downloading',
+    saveError: item.error || '',
+    saveFilename: filename,
+    saveReceived: received,
+    saveTotal: total,
+  });
+  return {
+    state: currentState,
+    error: item.error,
+    filename,
+    path: item.filename || '',
+    received,
+    total,
+  };
+}
+
+chrome.downloads.onChanged.addListener(async delta => {
+  await stateReady;
+  if (delta.id !== state.downloadId) return;
+  try { await refreshDownloadStatus(delta.id); } catch (_) {}
+});
 
 /* ═══════════════════════════════════════════════════════
    Offscreen 生命周期
@@ -83,11 +145,67 @@ async function ensureOffscreen() {
    用户关窗无人清理状态，storage.session 里残留假「录制中」。
    ═══════════════════════════════════════════════════════ */
 
+function markSaveContextLost(message) {
+  setState({
+    status: 'idle',
+    processing: false,
+    savePhase: 'error',
+    processingStage: '',
+    saveError: message,
+    saveCanRetry: false,
+  });
+  badge('error');
+}
+
+let saveWindowPromise = null;
+
+async function openSaveWindow() {
+  if (saveWindowPromise) return await saveWindowPromise;
+  const pending = (async () => {
+    if (state.saveWindowId) {
+      try {
+        await chrome.windows.update(state.saveWindowId, { focused: true });
+        return state.saveWindowId;
+      } catch (_) {
+        setState({ saveWindowId: 0 });
+      }
+    }
+    const win = await chrome.windows.create({
+      url: chrome.runtime.getURL('save-status.html'),
+      type: 'popup', width: 420, height: 360, focused: true,
+    });
+    setState({ saveWindowId: win.id });
+    return win.id;
+  })();
+  saveWindowPromise = pending;
+  try {
+    return await pending;
+  } finally {
+    if (saveWindowPromise === pending) saveWindowPromise = null;
+  }
+}
+
+async function reconcileEngineContext() {
+  if (!state.processing || state.mode !== 'tab') return;
+  if (!chrome.runtime.getContexts) return;
+  const generation = state.saveGeneration;
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (generation !== state.saveGeneration) return;
+  if (!contexts.length) markSaveContextLost('录制上下文已关闭，无法继续保存');
+}
+
 chrome.windows.onRemoved.addListener(async windowId => {
   await stateReady;   // SW 刚被唤醒时 state 可能尚未恢复
+  if (windowId && windowId === state.saveWindowId && state.saveWindowId !== 0) {
+    setState({ saveWindowId: 0 });
+    return;
+  }
   if (windowId && windowId === state.recorderWindowId && state.recorderWindowId !== 0) {
-    if (state.status !== 'idle') {
-      setState({ status: 'idle', recorderWindowId: 0, recorderTabId: 0 });
+    setState({ recorderWindowId: 0, recorderTabId: 0 });
+    if (state.processing) {
+      markSaveContextLost('录制窗口已关闭，无法继续保存');
+    } else if (state.status !== 'idle') {
+      setState({ status: 'idle' });
       badge('idle');
     }
   }
@@ -113,6 +231,8 @@ async function route(msg) {
       if (state.status !== 'idle' || state.processing) {
         return { error: '已有录制进行中或仍在保存，请先停止' };
       }
+      resetSaveResult();
+      setState({ saveGeneration: state.saveGeneration + 1 });
       if (msg.source === 'tab' && !msg.compatMode) return await startTabRecording(msg);
       if (msg.source === 'tab' && msg.compatMode)  return await startCompatTabRecording(msg);
       return await startDesktopRecording(msg);
@@ -120,10 +240,17 @@ async function route(msg) {
 
     /* ── 停止录制 ─────────────────────────────────────── */
     case 'STOP_RECORDING': {
+      const finalizing = state.status === 'recording' || state.status === 'paused';
       // 发停止指令让引擎跑完 onStopped（保存文件）；
       // desktop 模式引擎保存完会自己关窗口，无需在这里直接 remove
       await sendToRecorderEngine('OFF_STOP');
-      setState({ status: 'idle' }); badge('idle');
+      if (finalizing) {
+        setState({ status: 'idle', processing: true, savePhase: 'processing', processingStage: 'finalizing' });
+        badge('saving');
+      } else {
+        setState({ status: 'idle' });
+        badge('idle');
+      }
       return { ok: 1 };
     }
 
@@ -146,14 +273,77 @@ async function route(msg) {
 
     /* ── 丢弃 ─────────────────────────────────────────── */
     case 'DISCARD_RECORDING': {
+      if (state.processing && (state.savePhase !== 'error' || !state.saveCanRetry)) {
+        return { error: '视频正在保存，暂不能丢弃' };
+      }
       await sendToRecorderEngine('OFF_DISCARD');
-      setState({ status: 'idle', fileSize: 0 }); badge('idle');
+      setState({ status: 'idle', fileSize: 0, processing: false });
+      resetSaveResult();
+      badge('idle');
       return { ok: 1 };
     }
 
     /* ── 状态查询（popup 轮询）────────────────────────── */
     case 'GET_STATE':
+      await reconcileEngineContext();
       return { ...state };
+
+    case 'OPEN_SAVE_WINDOW': {
+      if (state.mode !== 'tab') return { error: '当前录制使用桌面保存窗口' };
+      return { ok: 1, windowId: await openSaveWindow() };
+    }
+
+    case 'RETRY_SAVE': {
+      if (state.savePhase !== 'error' || !state.saveCanRetry) {
+        return { error: '当前没有可重试的保存任务' };
+      }
+      const generation = state.saveGeneration + 1;
+      setState({
+        processing: true, savePhase: 'processing', processingStage: 'download',
+        downloadId: 0, saveError: '', saveReceived: 0, saveTotal: 0,
+        saveGeneration: generation,
+      });
+      badge('saving');
+      const result = await sendToRecorderEngine('OFF_RETRY_SAVE');
+      if (generation !== state.saveGeneration) return { error: '保存任务已替换，忽略过期结果' };
+      if (result === true || result?.ok === 1) return { ok: 1 };
+      const message = result?.error || '重试请求未送达或保存尚未完成，请保持录制上下文打开后重试';
+      setState({
+        status: 'idle', processing: true, savePhase: 'error', processingStage: '',
+        saveError: message, saveCanRetry: true,
+      });
+      badge('error');
+      return { error: message };
+    }
+
+    case 'SAVE_FILE': {
+      if (!state.processing) return { error: '当前没有待保存的录制' };
+      if (state.savePhase === 'complete' || (state.savePhase === 'downloading' && state.downloadId)) {
+        return { error: '当前录制已有下载任务' };
+      }
+      if (typeof msg.url !== 'string' || !msg.url.startsWith('blob:') || !msg.filename) {
+        return { error: '保存参数无效' };
+      }
+      const generation = state.saveGeneration;
+      const downloadId = await chrome.downloads.download({
+        url: msg.url,
+        filename: msg.filename,
+        conflictAction: 'uniquify',
+        saveAs: false,
+      });
+      if (generation !== state.saveGeneration) {
+        return { error: '保存任务已替换，忽略过期下载' };
+      }
+      setState({
+        savePhase: 'downloading', processingStage: 'download', downloadId,
+        saveError: '', saveFilename: msg.filename, saveCanRetry: true,
+        saveReceived: 0, saveTotal: 0,
+      });
+      return { downloadId };
+    }
+
+    case 'GET_DOWNLOAD_STATUS':
+      return await refreshDownloadStatus(msg.downloadId);
 
     /* ── offscreen / recorder 窗口取 tab 的 streamId ──────
        延迟到录制真正开始前才取：getMediaStreamId 的 id 应尽快消费，
@@ -170,8 +360,28 @@ async function route(msg) {
     case 'RECORDING_STOPPED':
     case 'RECORDER_STOPPED': {
       setState({ status: 'idle', fileSize: 0, recorderWindowId: 0, recorderTabId: 0, processing: false });
+      if (msg.discarded) {
+        resetSaveResult();
+      } else if (msg.historyEntry) {
+        setState({ savePhase: 'complete', saveCanRetry: false });
+        saveHistory(msg.historyEntry);
+      }
       badge('idle');
-      if (msg.historyEntry) saveHistory(msg.historyEntry);
+      return { ok: 1 };
+    }
+
+    case 'ENGINE_SAVE_ERROR': {
+      const canRetry = msg.canRetry !== false;
+      setState({
+        status: 'idle',
+        processing: canRetry,
+        savePhase: 'error',
+        processingStage: '',
+        saveError: msg.message || '保存失败',
+        saveCanRetry: canRetry,
+      });
+      badge(canRetry ? 'error' : 'idle');
+      if (canRetry && state.mode === 'tab') await openSaveWindow();
       return { ok: 1 };
     }
 
@@ -194,8 +404,20 @@ async function route(msg) {
       }
       return { ok: 1 };
     }
-    case 'ENGINE_PROCESSING':   // 引擎进入/离开保存链（fixWebM/转码）
-      setState({ processing: !!msg.active });
+    case 'ENGINE_PROCESSING':   // 引擎进入/离开保存链（fixWebM/转码/下载）
+      if (msg.active) {
+        setState({
+          status: 'idle',
+          processing: true,
+          savePhase: msg.stage === 'download' ? 'downloading' : 'processing',
+          processingStage: msg.stage || '',
+          saveCanRetry: true,
+        });
+        badge('saving');
+        if (state.mode === 'tab') await openSaveWindow();
+      } else {
+        setState({ processing: false, processingStage: '' });
+      }
       return { ok: 1 };
     case 'RECORDER_STARTED': {
       setState({
@@ -227,13 +449,14 @@ async function route(msg) {
 async function sendToRecorderEngine(type, extra = {}) {
   if (state.mode === 'tab') {
     try {
-      await chrome.runtime.sendMessage({ type, target: 'offscreen', ...extra });
-    } catch (_) {}
+      return await chrome.runtime.sendMessage({ type, target: 'offscreen', ...extra });
+    } catch (_) { return null; }
   } else if (state.mode === 'desktop' && state.recorderTabId) {
     try {
-      await chrome.tabs.sendMessage(state.recorderTabId, { type, ...extra });
-    } catch (_) {}
+      return await chrome.tabs.sendMessage(state.recorderTabId, { type, ...extra });
+    } catch (_) { return null; }
   }
+  return null;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -372,6 +595,8 @@ function badge(mode) {
   const m = {
     recording: { text: 'REC', color: '#ff4757' },
     paused:    { text: '❚❚', color: '#ffa502' },
+    saving:    { text: 'SAVE', color: '#ffa502' },
+    error:     { text: '!',   color: '#ff4757' },
     idle:      { text: '',    color: '#000' },
   };
   const b = m[mode] || m.idle;
