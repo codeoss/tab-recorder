@@ -17,7 +17,7 @@
 | 📐 分辨率/帧率/比特率 | 480p / 720p / 1080p / 1440p / 4K；15/24/30/60 fps；4/8/16 Mbps |
 | ⏱️ 倒计时 | 录制前可选 3/5/10 秒倒计时 |
 | ⏸️ 暂停 / 恢复 / 丢弃 | 录制中可暂停、恢复或丢弃 |
-| 🎬 WebM 输出 | 原生 `MediaRecorder`，补 SeekHead/Cues/Duration，Chrome 与 Windows 媒体播放器均可拖动 |
+| 🎬 WebM 输出 | 原生 `MediaRecorder`，补 SeekHead、关键帧 Cues 和 Duration，拖动时从真实关键帧开始解码，避免先花屏 |
 | 📦 可选 MP4 输出 | 新版 Chrome 原生录制（编码随平台：Win/macOS 为 H.264/AAC，Linux 为 VP9/Opus-in-MP4）；老版本用 ffmpeg.wasm 转码 |
 | 💾 保存状态可见 | 整理/转码/下载各阶段清晰可见；真实下载完成后才显示已保存，失败可重试或明确丢弃 |
 | ☁️ 云桌面兼容模式 | RDP/云桌面下 tabCapture 音频劫持失效时的兜底方案 |
@@ -73,6 +73,8 @@ tab-recorder-ext/
 - **标签页模式**：录制引擎跑在 [offscreen document](https://developer.chrome.com/docs/extensions/reference/api/offscreen) 内，这是一个独立于任何窗口的后台页面，popup 关闭、Chrome 最小化都不影响其持有的 `MediaRecorder`。
 - **窗口/屏幕模式**：扩展会弹出一个独立的 popup 窗口，其副标题写明「此窗口可最小化，录制不会中断」。`getDisplayMedia` / `getUserMedia` 的媒体流与窗口可见性无关。
 
+**窗口/屏幕/兼容模式的控制统一在 recorder 窗口完成**：开始、暂停、停止和丢弃都在该窗口操作；主弹窗只显示状态并提供「打开录制窗口」。选择画面和音频期间处于准备状态，尚未开始录制，实际开始后才显示并累计录制时间。取消选屏后可在原窗口重试；窗口关闭后则可重新开始。
+
 ### 防静音（重要）
 
 `tabCapture` 会把标签页音频「劫持」走，导致录制时用户听不到声音。本扩展用 `AudioContext` 把音频接到扬声器做回环，勾选「录制时保持标签页声音」即可在录制时继续听到。
@@ -99,7 +101,9 @@ tab-recorder-ext/
 | 新版 Chrome 但 JS faststart 不适用（非常规 MP4） | 用 ffmpeg 内核做 faststart 兜底 | 可拖动的 `.mp4` |
 | 老版本 Chrome（无原生 MP4） | 先录 WebM，结束后用 ffmpeg 内核转码（慢，长视频可达数十分钟） | 可拖动的 `.mp4`；无内核或转码失败回退 `.webm` |
 
-WebM 保存时也会补规范的 `SeekHead`，使 Windows Media Foundation 能发现已有的 `Cues` 索引；不是仅让 Chrome 可拖。
+WebM 保存时也会补规范的 `SeekHead`，并只为真实视频关键帧建立 `Cues`，使 Windows Media Foundation 能从关键帧开始解码，而不是仅让进度条可以拖动。
+
+**MP4 布局边界**：普通 MP4 即使 `moov` 在末尾，纯 JS faststart 也能处理；**分片 MP4 且 `moov` 在末尾**暂未扩展纯 JS 支持，继续走可选 wasm 兜底。没有 wasm 或兜底失败时保留原始 MP4，不丢录制，但时长/索引可能仍未修复。前因后果、偏移风险与后续验收计划见 [`docs/todo/moov-at-end-fmp4.md`](docs/todo/moov-at-end-fmp4.md)。
 
 > **PotPlayer 打开 MP4 很慢？** 不同 Chrome 版本的分片布局和 mfra 情况不同。扩展已补齐 fMP4 时长，但弱 fMP4 播放器仍可能因逐分片建索引而打开较慢，可用 ffmpeg 重封装改善（流复制，不重编码）：
 > `ffmpeg -i 录制的.mp4 -c copy -movflags +faststart 修复后.mp4`
@@ -161,6 +165,8 @@ npm i @ffmpeg/core@0.12.10
 
 - [ ] 标签页录制 + 最小化 Chrome 30s → 文件正常且可拖动进度
 - [ ] WebM 与原生 MP4 均能在 Windows 媒体播放器前/中/后段拖动
+- [ ] WebM 反复拖动到不同时间点 → 不先花屏再恢复，能从关键帧正常解码
+- [ ] 窗口/兼容模式选择画面和音频时不提前计时，实际开始后才计时；控制只在 recorder 窗口
 - [ ] 定时停止 10s → 到点自动保存
 - [ ] 停止后立即关闭主弹窗，独立保存窗口仍显示进度；可手动重开
 - [ ] 保存期间不出现提前“已保存”，下载完成后才写历史

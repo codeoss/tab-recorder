@@ -2,7 +2,7 @@
  * background.js — Service Worker (MV3)
  *
  * 职责：
- *   1. 维护全局录制状态机 (idle | countdown | recording | paused)
+ *   1. 维护全局录制状态机 (idle | preparing | countdown | recording | paused)
  *   2. 消息路由：把 popup 的指令分发给 offscreen / recorder 窗口
  *   3. 通过 chrome.tabCapture.getMediaStreamId 取得 streamId 并跨上下文传递
  *   4. 管理录制窗口生命周期与历史记录
@@ -17,7 +17,7 @@
  */
 
 const state = {
-  status: 'idle',          // idle | countdown | recording | paused
+  status: 'idle',          // idle | preparing | countdown | recording | paused
   startTime: 0,
   pausedTime: 0,
   pauseStart: 0,
@@ -220,7 +220,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   return true; // 异步回复
 });
 
-async function route(msg) {
+async function route(msg, sender = {}) {
   await stateReady;   // 确保 SW 回收后已恢复 state
   switch (msg.type) {
 
@@ -240,6 +240,17 @@ async function route(msg) {
 
     /* ── 停止录制 ─────────────────────────────────────── */
     case 'STOP_RECORDING': {
+      if (state.status === 'preparing') {
+        if (state.mode === 'desktop' && state.recorderWindowId) {
+          try { await chrome.windows.remove(state.recorderWindowId); } catch (_) {}
+        }
+        setState({
+          status: 'idle', startTime: 0, recorderWindowId: 0, recorderTabId: 0,
+          processing: false, countdownRemaining: 0,
+        });
+        badge('idle');
+        return { ok: 1 };
+      }
       const finalizing = state.status === 'recording' || state.status === 'paused';
       // 发停止指令让引擎跑完 onStopped（保存文件）；
       // desktop 模式引擎保存完会自己关窗口，无需在这里直接 remove
@@ -287,6 +298,32 @@ async function route(msg) {
     case 'GET_STATE':
       await reconcileEngineContext();
       return { ...state };
+
+    case 'OPEN_RECORDER_WINDOW': {
+      if (state.mode !== 'desktop' || !state.recorderWindowId) {
+        return { error: '当前没有可打开的录制窗口' };
+      }
+      const windowId = state.recorderWindowId;
+      try {
+        await chrome.windows.update(windowId, { focused: true });
+        return { ok: 1, windowId };
+      } catch (_) {
+        try {
+          await chrome.windows.get(windowId);
+          return { error: '录制窗口暂时无法聚焦' };
+        } catch (_) {
+          if (windowId !== state.recorderWindowId) return { error: '录制窗口已变化' };
+          setState({ recorderWindowId: 0, recorderTabId: 0 });
+          if (state.processing || state.status !== 'preparing' && state.status !== 'idle') {
+            markSaveContextLost('录制窗口已关闭，录制已中止');
+          } else if (state.status === 'preparing') {
+            setState({ status: 'idle', startTime: 0, processing: false });
+            badge('idle');
+          }
+          return { error: '录制窗口已关闭或不可用' };
+        }
+      }
+    }
 
     case 'OPEN_SAVE_WINDOW': {
       if (state.mode !== 'tab') return { error: '当前录制使用桌面保存窗口' };
@@ -359,6 +396,16 @@ async function route(msg) {
     /* ── 来自 offscreen / recorder 的事件 ─────────────── */
     case 'RECORDING_STOPPED':
     case 'RECORDER_STOPPED': {
+      if (msg.captureFailed && state.status === 'preparing' &&
+          state.mode === 'desktop' && state.recorderWindowId) {
+        resetSaveResult();
+        setState({
+          status: 'preparing', startTime: 0, pausedTime: 0, pauseStart: 0,
+          fileSize: 0, processing: false,
+        });
+        badge('preparing');
+        return { ok: 1 };
+      }
       setState({ status: 'idle', fileSize: 0, recorderWindowId: 0, recorderTabId: 0, processing: false });
       if (msg.discarded) {
         resetSaveResult();
@@ -420,6 +467,13 @@ async function route(msg) {
       }
       return { ok: 1 };
     case 'RECORDER_STARTED': {
+      const senderTabId = sender.tab && sender.tab.id;
+      if (state.mode !== 'desktop' || state.status !== 'preparing' || !state.recorderWindowId) {
+        return { error: '录制已开始或已取消' };
+      }
+      if (state.recorderTabId && senderTabId && senderTabId !== state.recorderTabId) {
+        return { error: '录制窗口不匹配' };
+      }
       setState({
         status: 'recording',
         startTime: Date.now(),
@@ -562,13 +616,13 @@ async function openRecorderWindow(params, timeLimit) {
     mode: 'desktop',
     recorderWindowId: win.id,
     recorderTabId: tabId,
-    status: 'recording',
-    startTime: Date.now(),
+    status: 'preparing',
+    startTime: 0,
     pausedTime: 0,
     fileSize: 0,
     timeLimit: timeLimit || 0,
   });
-  badge('recording');
+  badge('preparing');
 
   return { ok: 1 };
 }
@@ -594,6 +648,7 @@ async function activeTab() {
 function badge(mode) {
   const m = {
     recording: { text: 'REC', color: '#ff4757' },
+    preparing: { text: 'WAIT', color: '#ffa502' },
     paused:    { text: '❚❚', color: '#ffa502' },
     saving:    { text: 'SAVE', color: '#ffa502' },
     error:     { text: '!',   color: '#ff4757' },

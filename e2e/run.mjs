@@ -12,7 +12,7 @@
  *   D. 原生 MP4：faststart/fMP4 时长修补与真实下载
  *   E. 保存状态可见：延迟下载、popup 关闭、进度窗口恢复、失败重试与明确丢弃
  *
- * 产物校验不依赖 ffprobe，直接读二进制：EBML/SeekHead/Cues/Duration、MP4 box/时长。
+ * 产物校验不依赖 ffprobe，直接读二进制：EBML/SeekHead/关键帧 Cues/Duration、MP4 box/时长。
  * Windows 无 xdotool 时可设 E2E_MANUAL_SHORTCUT=1，在提示后真实按 Ctrl+Shift+E；
  * NATIVE_CHROME_BIN 单独指定品牌 Chrome 的原生 MP4 测试路径。
  */
@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeCheckMp4 } from './lib-mp4check.mjs';
-import { checkWebMSeekStructure } from './lib-webmcheck.mjs';
+import { checkWebMSeekStructure, checkWebMKeyframeCues } from './lib-webmcheck.mjs';
 
 const E2E_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(E2E_DIR, '..');
@@ -200,6 +200,8 @@ function checkWebM(file, { minMs = 0, maxMs = Infinity } = {}) {
   ok('含 Cues 索引（可拖进度条）', b.includes(Buffer.from([0x1c, 0x53, 0xbb, 0x6b])));
   const seek = checkWebMSeekStructure(b);
   ok('SeekHead 三项与全部 Cue 精确定位', seek.errors.length === 0, seek.errors.join('；'));
+  const keyframes = checkWebMKeyframeCues(b);
+  ok('全部 Cue 均指向视频关键帧', keyframes.errors.length === 0, keyframes.errors.join('；'));
   ok('含 Opus 音频轨', b.includes(Buffer.from('A_OPUS')));
   // 只扫独立校验器定位的真实 Info 子元素，不能裸搜 SeekID 或媒体负载。
   const info = seek.info;
@@ -506,6 +508,11 @@ try {
   const restarted = await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'START_RECORDING', source: 'tab' }));
   ok('完成后允许新录制', !restarted.error, JSON.stringify(restarted));
   await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'DISCARD_RECORDING' }));
+  await waitBgState(s => s.status === 'idle' && !s.processing, '新录制丢弃后归位');
+  // 直接发 START/DISCARD 不经过 popup 本地方法；若轮询恰好在Discard前返回
+  // recording，下一次点击会误发 STOP。等真实按钮文案归位再录下一段。
+  await popup.waitForFunction(() =>
+    document.getElementById('recLabel').textContent === '点击开始录制', null, { timeout: 5000 });
 
   await setSaveGate(false, true);
   await recordAndStop();

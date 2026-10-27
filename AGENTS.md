@@ -11,7 +11,8 @@
 - **云桌面兼容模式**：RDP 下 tabCapture 音频劫持失效时，画面走 tabCapture（仅视频）、声音走 getDisplayMedia 系统音频
 - 可设定录制时长（定时停止）、分辨率、帧率、比特率、录制前倒计时
 - 暂停 / 恢复 / 丢弃；最近 5 次录制历史显示在弹窗
-- 输出 **WebM**（内置 SeekHead/Cues/Duration 修复，Chrome 与 WMP 可拖动），原生 **MP4**（faststart + fMP4 时长重建），老 Chrome 可选 ffmpeg.wasm 转码
+- 输出 **WebM**（内置 SeekHead/关键帧 Cues/Duration 修复，Chrome 与 WMP 可拖动），原生 **MP4**（faststart + fMP4 时长重建），老 Chrome 可选 ffmpeg.wasm 转码
+- **窗口/屏幕/兼容模式统一在 recorder 操作**：准备阶段不提前计时，实际开始后才计时；主 popup 显示状态并聚焦原窗口
 - **保存状态全程可见**：独立保存窗口 / recorder 窗口 / popup 同步；真实下载 complete 后才显示已保存并写历史，失败可重试或明确丢弃
 
 **完全离线，无任何数据上传。无 host_permissions，无 `tabs` 权限。**
@@ -71,16 +72,21 @@ core-recorder.js      # 公共录制引擎 createRecorderEngine({ getStream, onE
                       # MediaRecorder 生命周期、分片累积、定时停止；onStopped 异步链：
                       # fix-webm / MP4 处理 → await 下载 complete → saved/history；
                       # 失败保留最终 Blob，retrySave 只重试下载，明确丢弃才释放
-fix-webm.js           # 手写 EBML 解析器：补 SeekHead + 重建 Cues + 修补 Duration。
+fix-webm.js           # 手写 EBML 解析器：补 SeekHead + 只为真实视频关键帧重建 Cues + 修补 Duration。
+                      # 从 Tracks 识别视频轨；SimpleBlock 看 keyframe 位，BlockGroup 看 ReferenceBlock；
+                      # CueTime=Cluster.Timecode+Block 相对时间码，CueTrack 为真实视频轨号。
+                      # 必须有合法 Cluster.Timestamp；BlockGroup 子元素须完整解析到组尾，
+                      # 缺失/晚到时间码前的 Block、截断 ReferenceBlock 均不猜关键帧。
                       # SeekPosition/CueClusterPosition 均相对 Segment 数据区；头部插入统一计位移。
                       # 流式实现（生产路径）：256KB 滑窗扫描 + 稀疏编辑 + Blob.slice 拼装，
-                      # 内存 O(窗口+Cues) 与文件大小无关；legacy 全量实现保留为 golden 对照
-                      # （e2e/unit-webmstream.mjs + lib-webmcheck.mjs 校验真实元素落点）。
+                      # 跳过音频/媒体负载，内存 O(窗口+Cues)；legacy 全量实现保留为 golden 对照
+                      # （e2e/unit-webmstream.mjs + lib-webmcheck.mjs 校验落点和实际关键帧）。
                       # 幻影防护：只采信第一个解析干净的 Info；Cluster 前扫的候选须过结构校验
                       # （否则负载里的同字节幻影会出轨扫描、把编辑写进媒体数据——真实踩坑）
 mp4-faststart.js      # 常规 MP4 faststart + 已 faststart fMP4 的 mvhd/tkhd/mdhd 时长重建。
                       # 只读 moov/moof（tfhd/tfdt/trun/trex），mdat/moof/mfra 原样保留；
                       # 内存 O(moov+单个 moof+分片元数据)，GB 级长视频可用（替代 wasm 方案）
+                      # 分片 moov-at-end 的纯 JS 支持仍是待办：docs/todo/moov-at-end-fmp4.md
                       # 注释为英文（移植自 ScreenCap Pro v1.4.1），修改时保持英文注释风格
 transcoder.js         # ffmpeg 主线程入口（懒加载）：webmToMp4(blob) / mp4Faststart(blob)，
                       # 内部把任务 postMessage 给 worker；超时随输入大小缩放，超时 terminate 重建
@@ -95,10 +101,11 @@ icons/                # 16/48/128 PNG 图标
 
 ## 消息协议（改代码时保持兼容）
 
-- popup → background：`START_RECORDING`（带 `source: 'tab'|'window'|'screen'`、`compatMode`、分辨率/fps/quality/timeLimit/outputFormat/countdownSec 等；非 idle 或保存处理中时会被拒绝——重入守卫）、`STOP/PAUSE/RESUME/DISCARD_RECORDING`、`GET_STATE`（1.5s 轮询）、`OPEN_SAVE_WINDOW`、`RETRY_SAVE`
+- `state.status`：`idle | preparing | countdown | recording | paused`。desktop/compat 创建 recorder 窗口后是 `preparing` 且 `startTime=0`，选择期间不累计录制时长；原生取流取消/失败（`captureFailed:true`）保持 preparing 和原窗口 ID，支持同窗口重试。`RECORDER_STARTED` 仅接受当前 desktop 窗口的 preparing→recording 转换，重复/错误来源不重置计时。准备中 STOP 关闭等待窗口，不进入保存链；聚焦失效经 `windows.get` 确认后清理并允许重开
+- popup → background：`START_RECORDING`（带 `source: 'tab'|'window'|'screen'`、`compatMode`、分辨率/fps/quality/timeLimit/outputFormat/countdownSec 等；非 idle 或保存处理中时会被拒绝——重入守卫）、`STOP/PAUSE/RESUME/DISCARD_RECORDING`、`GET_STATE`（1.5s 轮询）、`OPEN_SAVE_WINDOW`、`RETRY_SAVE`、**desktop/compat 只用 `OPEN_RECORDER_WINDOW` 聚焦原 recorder 窗口，不重复提供停止/暂停入口**
 - background → 录制引擎：`OFF_START`（仅 offscreen，带 `tabId`）、`OFF_STOP`、`OFF_PAUSE`、`OFF_RESUME`、`OFF_DISCARD`、`OFF_RETRY_SAVE`。tab 模式经 `chrome.runtime.sendMessage`（带 `target: 'offscreen'` 过滤）；desktop 模式经 `chrome.tabs.sendMessage(recorderTabId, ...)`。streamId 不随 OFF_START 下发：`getMediaStreamId` 的 id 应尽快消费，引擎在倒计时/选屏结束后才发 `GET_STREAM_ID`（带 tabId）现取现用
 - 引擎保存文件：`save-file.js` 创建 Blob URL 并发 `SAVE_FILE {url, filename}` 给 background，随后每秒 `GET_DOWNLOAD_STATUS {downloadId}` 直到 complete/interrupted；background 返回真实文件名、路径和 received/total
-- 引擎 → background：offscreen 发 `RECORDING_STOPPED`、`FILE_SIZE_UPDATE`、`COUNTDOWN_TICK`、`ENGINE_PROCESSING`（含 stage）、`ENGINE_SAVE_ERROR`；recorder 窗口发 `RECORDER_STARTED`、`RECORDER_STOPPED`、`FILE_SIZE_UPDATE`、`ENGINE_PROCESSING`、`ENGINE_SAVE_ERROR`、`ENGINE_PAUSED`/`ENGINE_RESUMED`。停止时带 `historyEntry`（仅在下载 complete 后）与可选 `discarded`
+- 引擎 → background：offscreen 发 `RECORDING_STOPPED`、`FILE_SIZE_UPDATE`、`COUNTDOWN_TICK`、`ENGINE_PROCESSING`（含 stage）、`ENGINE_SAVE_ERROR`；recorder 窗口发 `RECORDER_STARTED`、`RECORDER_STOPPED`、`FILE_SIZE_UPDATE`、`ENGINE_PROCESSING`、`ENGINE_SAVE_ERROR`、`ENGINE_PAUSED`/`ENGINE_RESUMED`。停止时带 `historyEntry`（仅在下载 complete 后）与可选 `discarded`；取流取消/失败另带 `captureFailed:true`，与最终 stopped 区分
 
 引擎内部事件（`onEvent` 回调）：`started / paused / resumed / tick / size / processing({active,stage}) / saveerror / stopped / saved`。
 
@@ -122,7 +129,7 @@ cp node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.{js,wasm} lib/ffmpeg/
 ## 测试与验证
 
 **E2E 测试在 `e2e/`**（Playwright + 系统 X11 + xdotool）：`cd e2e && npm i && npm test`。
-- 单元：`unit-webmstream.mjs`（含 SeekHead/Cue 真实落点）、`unit-mp4faststart.mjs`、`unit-native-mp4.mjs`、`unit-save-state.mjs`、`unit-save-engine.mjs`、`unit-save-ui.mjs`、`unit-popup-save.mjs`、`unit-recorder-save.mjs`。
+- 单元：`unit-webmstream.mjs`（SeekHead/Cue 落点与实际视频关键帧）、`unit-mp4faststart.mjs`、`unit-native-mp4.mjs`、`unit-save-state.mjs`、`unit-save-engine.mjs`、`unit-save-ui.mjs`、`unit-popup-save.mjs`、`unit-popup-recorder.mjs`（准备态/实际计时/单一入口）、`unit-recorder-save.mjs`。
 - 场景 A–E：完整录制、倒计时取消竞态、暂停中停止、原生 MP4、保存状态可见（延迟下载、popup 关闭、失败重试、明确丢弃）。
 - Windows 没有 xdotool/WSL 时，可用 `E2E_MANUAL_SHORTCUT=1` 留出真实 Ctrl+Shift+E 按键窗口；`NATIVE_CHROME_BIN` 指定品牌 Chrome 做原生 MP4 测试。默认 Linux 路径与行为不变。
 - 品牌版 Chrome ≥137 禁用 `--load-extension`（E2E 用 Playwright 自带 Chromium/CfT）；CfT 上 offscreen 偶发被提前回收（rig 局限，生产无此问题）。详见 `e2e/run.mjs` 头部注释。
@@ -130,8 +137,8 @@ cp node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.{js,wasm} lib/ffmpeg/
 **手工验证仍不可替代**（云桌面兼容模式等需要真实 RDP 环境）：
 - 静态检查：改完 JS 可用 `node --check <file>` 验证语法（注意 worker/offscreen 里的 `chrome.*` API 在 node 下不存在，仅做语法检查）
 - 功能验证按 README 的「🧪 验证清单」逐项手工过，必须包含：
-  - WebM/MP4 在 Windows 媒体播放器前中后段拖动；可用 Media Foundation 的 `CAN_SEEK`、`MF_PD_DURATION` 和 seek 后样本时间作客观对照
-  - 定时停止、切换分辨率、窗口模式、兼容模式系统音频
+  - WebM/MP4 在 Windows 媒体播放器前中后段拖动；WebM 不应先花屏。可用 Media Foundation 的 `CAN_SEEK`、`MF_PD_DURATION` 和 seek 后样本时间作客观对照，并用独立校验器检查全部 Cue 的视频关键帧
+  - desktop/compat 选择画面和音频期间不提前计时；控制只在 recorder 窗口；定时停止、切换分辨率、兼容模式系统音频
   - 停止后关闭 popup 的保存可见性、失败重试、明确丢弃、service worker 回收后恢复
   - 尝试关闭保存窗口/Chrome，确认 beforeunload 边界；强制退出仍可能丢文件，不承诺绝对防丢
 
