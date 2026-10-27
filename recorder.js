@@ -175,7 +175,7 @@ async function startCompatCapture() {
     showError(e.name === 'NotAllowedError'
       ? '用户取消了选择。请选择「整个屏幕」并勾选「分享系统音频」'
       : '获取系统音频失败: ' + e.message);
-    notifyBg('RECORDER_STOPPED', { historyEntry: null });
+    notifyBg('RECORDER_STOPPED', { historyEntry: null, captureFailed: true });
     return null;
   }
 
@@ -185,7 +185,7 @@ async function startCompatCapture() {
 
   if (sysAudioTracks.length === 0) {
     showError('未获取到系统音频。请确保勾选了「分享系统音频」');
-    notifyBg('RECORDER_STOPPED', { historyEntry: null });
+    notifyBg('RECORDER_STOPPED', { historyEntry: null, captureFailed: true });
     return null;
   }
 
@@ -201,7 +201,7 @@ async function startCompatCapture() {
     showError('获取标签页 streamId 失败: ' + e.message);
     sysAudioTracks.forEach(t => t.stop());
     screenAudioStream = null;
-    notifyBg('RECORDER_STOPPED', { historyEntry: null });
+    notifyBg('RECORDER_STOPPED', { historyEntry: null, captureFailed: true });
     return null;
   }
 
@@ -218,7 +218,7 @@ async function startCompatCapture() {
     showError('获取标签页画面失败: ' + e.message);
     sysAudioTracks.forEach(t => t.stop());
     screenAudioStream = null;
-    notifyBg('RECORDER_STOPPED', { historyEntry: null });
+    notifyBg('RECORDER_STOPPED', { historyEntry: null, captureFailed: true });
     return null;
   }
 
@@ -243,7 +243,7 @@ async function startDesktopCapture() {
     return stream;
   } catch (e) {
     showError(e.name === 'NotAllowedError' ? '用户取消了选择' : '获取媒体流失败: ' + e.message);
-    notifyBg('RECORDER_STOPPED', { historyEntry: null });
+    notifyBg('RECORDER_STOPPED', { historyEntry: null, captureFailed: true });
     return null;
   }
 }

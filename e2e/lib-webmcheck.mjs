@@ -89,6 +89,18 @@ function children(b, start, end) {
   return out;
 }
 
+function completeChildren(b, start, end) {
+  const out = [];
+  let pos = start;
+  while (pos < end) {
+    const el = readElement(b, pos);
+    if (!el || el.unknown || el.end > end || el.end <= pos) return null;
+    out.push(el);
+    pos = el.end;
+  }
+  return out;
+}
+
 function findCues(b) {
   const signature = Buffer.from([0x1C, 0x53, 0xBB, 0x6B]);
   let at = b.length;
@@ -154,18 +166,22 @@ function videoBlock(b, block, trackNumber, clusterTime) {
 
 function clusterKeyframe(b, cluster, trackNumber, mediaEnd) {
   const end = cluster.unknown ? mediaEnd : cluster.end;
-  let clusterTime = 0;
+  let clusterTime = null;
   for (let pos = cluster.dataOff; pos < end;) {
     const child = readElement(b, pos);
     if (!child || child.unknown || child.end > end || child.end <= pos) break;
     if (child.id === ID.CLUSTER || child.id === ID.CUES) break;
     if (child.id === ID.TIMECODE) {
+      if (child.end - child.dataOff < 1 || child.end - child.dataOff > 8) break;
       clusterTime = uint(b, child.dataOff, child.end - child.dataOff);
     } else if (child.id === ID.SIMPLEBLOCK) {
+      if (clusterTime === null) { pos = child.end; continue; }
       const block = videoBlock(b, child, trackNumber, clusterTime);
       if (block && (block.flags & 0x80)) return block;
     } else if (child.id === ID.BLOCKGROUP) {
-      const group = children(b, child.dataOff, child.end);
+      if (clusterTime === null) { pos = child.end; continue; }
+      const group = completeChildren(b, child.dataOff, child.end);
+      if (!group) break;
       if (!group.some(x => x.id === ID.REFERENCEBLOCK)) {
         for (const item of group) {
           if (item.id !== ID.BLOCK) continue;

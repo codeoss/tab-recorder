@@ -262,7 +262,7 @@
   }
 
   function findClusterKeyframeSync(dv, start, end, videoTrack) {
-    let clusterTime = 0;
+    let clusterTime = null;
     for (let pos = start; pos < end;) {
       const id = readId(dv, pos);
       if (!id || id.id === ID.CLUSTER || id.id === ID.CUES) break;
@@ -271,19 +271,22 @@
       const dataOff = pos + id.len + sz.len;
       if (dataOff + sz.val > end) break;
       if (id.id === ID.TIMECODE) {
+        if (sz.val < 1 || sz.val > 8) break;
         clusterTime = readUint(dv, dataOff, sz.val);
       } else if (id.id === ID.SIMPLE_BLOCK) {
+        if (clusterTime === null) { pos = dataOff + sz.val; continue; }
         const block = blockHeaderSync(dv, dataOff, dataOff + sz.val, videoTrack);
         if (block && (block.flags & 0x80)) return clusterTime + block.relative;
       } else if (id.id === ID.BLOCK_GROUP) {
+        if (clusterTime === null) { pos = dataOff + sz.val; continue; }
         const groupEnd = dataOff + sz.val;
-        let referenced = false, candidate = null;
-        for (let p = dataOff; p < groupEnd;) {
+        let referenced = false, candidate = null, complete = true, p = dataOff;
+        for (; p < groupEnd;) {
           const childId = readId(dv, p);
           const childSz = childId && readSize(dv, p + childId.len);
-          if (!childId || !childSz || childSz.unknown) break;
+          if (!childId || !childSz || childSz.unknown) { complete = false; break; }
           const childData = p + childId.len + childSz.len;
-          if (childData + childSz.val > groupEnd) break;
+          if (childData + childSz.val > groupEnd) { complete = false; break; }
           if (childId.id === ID.REFERENCE_BLOCK) referenced = true;
           if (childId.id === ID.BLOCK) {
             const block = blockHeaderSync(dv, childData, childData + childSz.val, videoTrack);
@@ -291,7 +294,9 @@
           }
           p = childData + childSz.val;
         }
-        if (candidate !== null && !referenced) return clusterTime + candidate;
+        if (p !== groupEnd) complete = false;
+        if (complete && candidate !== null && !referenced) return clusterTime + candidate;
+        if (!complete) break;
       }
       pos = dataOff + sz.val;
     }
@@ -743,7 +748,7 @@
   }
 
   async function findClusterKeyframe(rd, start, end, videoTrack) {
-    let clusterTime = 0;
+    let clusterTime = null;
     for (let pos = start; pos < end;) {
       const id = await rd.readId(pos);
       if (!id || id.id === ID.CLUSTER || id.id === ID.CUES) break;
@@ -752,19 +757,22 @@
       const dataOff = pos + id.len + sz.len;
       if (dataOff + sz.val > end) break;
       if (id.id === ID.TIMECODE) {
+        if (sz.val < 1 || sz.val > 8) break;
         clusterTime = await rd.readUint(dataOff, sz.val);
       } else if (id.id === ID.SIMPLE_BLOCK) {
+        if (clusterTime === null) { pos = dataOff + sz.val; continue; }
         const block = await blockHeader(rd, dataOff, dataOff + sz.val, videoTrack);
         if (block && (block.flags & 0x80)) return clusterTime + block.relative;
       } else if (id.id === ID.BLOCK_GROUP) {
+        if (clusterTime === null) { pos = dataOff + sz.val; continue; }
         const groupEnd = dataOff + sz.val;
-        let referenced = false, candidate = null;
-        for (let p = dataOff; p < groupEnd;) {
+        let referenced = false, candidate = null, complete = true, p = dataOff;
+        for (; p < groupEnd;) {
           const childId = await rd.readId(p);
           const childSz = childId && await rd.readSize(p + childId.len);
-          if (!childId || !childSz || childSz.unknown) break;
+          if (!childId || !childSz || childSz.unknown) { complete = false; break; }
           const childData = p + childId.len + childSz.len;
-          if (childData + childSz.val > groupEnd) break;
+          if (childData + childSz.val > groupEnd) { complete = false; break; }
           if (childId.id === ID.REFERENCE_BLOCK) referenced = true;
           if (childId.id === ID.BLOCK) {
             const block = await blockHeader(rd, childData, childData + childSz.val, videoTrack);
@@ -772,7 +780,9 @@
           }
           p = childData + childSz.val;
         }
-        if (candidate !== null && !referenced) return clusterTime + candidate;
+        if (p !== groupEnd) complete = false;
+        if (complete && candidate !== null && !referenced) return clusterTime + candidate;
+        if (!complete) break;
       }
       pos = dataOff + sz.val;
     }

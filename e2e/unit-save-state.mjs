@@ -40,6 +40,7 @@ function harness(initialState = null) {
         return { id: 100, tabs: [{ id: 200 }] };
       },
       update: async id => { focusedWindows.push(id); return { id }; },
+      get: async id => ({ id }),
       remove: async () => {},
     },
     tabs: {
@@ -85,10 +86,10 @@ function harness(initialState = null) {
     chrome, console, URLSearchParams, setTimeout, clearTimeout,
   }, { filename: 'background.js' });
   if (!listeners.downloadChanged) listeners.downloadChanged = async () => {};
-  async function send(type, extra = {}) {
+  async function send(type, extra = {}, sender = {}) {
     return new Promise((resolve, reject) => {
       try {
-        const result = listeners.message({ type, ...extra }, {}, value => resolve(value ?? {}));
+        const result = listeners.message({ type, ...extra }, sender, value => resolve(value ?? {}));
         if (result !== true) reject(new Error(`消息 ${type} 未异步回复`));
       } catch (error) { reject(error); }
     });
@@ -395,6 +396,54 @@ for (const initial of [
   const result = await h.send('OPEN_RECORDER_WINDOW');
   ok('tab 或失效 recorder 窗口不得伪造聚焦成功', !!result.error && h.createdWindows.length === 0,
     JSON.stringify(result));
+}
+
+{
+  const h = harness({
+    status: 'preparing', mode: 'desktop', startTime: 0,
+    recorderWindowId: 77, recorderTabId: 88,
+  });
+  await h.send('RECORDER_STOPPED', { historyEntry: null, captureFailed: true });
+  const cancelled = await h.send('GET_STATE');
+  const duplicate = await h.send('START_RECORDING', { source: 'window' });
+  ok('原生取消保留同窗口准备态和所有权', cancelled.status === 'preparing' &&
+    cancelled.recorderWindowId === 77 && cancelled.recorderTabId === 88 && !!duplicate.error,
+    JSON.stringify(cancelled));
+  await h.send('RECORDER_STARTED', {}, { tab: { id: 88 } });
+  const retry = await h.send('GET_STATE');
+  ok('同一 recorder 重试后恢复真实录制状态', retry.status === 'recording' &&
+    retry.startTime > 0 && retry.recorderWindowId === 77 && retry.recorderTabId === 88,
+    JSON.stringify(retry));
+}
+
+{
+  const h = harness({
+    status: 'preparing', mode: 'desktop', startTime: 0,
+    recorderWindowId: 77, recorderTabId: 88,
+  });
+  await h.send('RECORDER_STARTED', {}, { tab: { id: 88 } });
+  const started = await h.send('GET_STATE');
+  h.session.recorderState.pausedTime = 1234;
+  await h.send('RECORDER_STARTED', {}, { tab: { id: 88 } });
+  const duplicate = await h.send('GET_STATE');
+  ok('重复 started 不重置开始时间和暂停累计', duplicate.startTime === started.startTime &&
+    duplicate.pausedTime === 1234, JSON.stringify(duplicate));
+  const stale = await h.send('RECORDER_STARTED', {}, { tab: { id: 999 } });
+  ok('错误 recorder 来源的 started 被拒绝', !!stale.error && duplicate.startTime === started.startTime,
+    JSON.stringify(stale));
+}
+
+for (const status of ['preparing', 'recording']) {
+  const h = harness({ status, mode: 'desktop', recorderWindowId: 77, recorderTabId: 88, startTime: 1000 });
+  h.chrome.windows.update = async () => { throw new Error('窗口不存在'); };
+  h.chrome.windows.get = async () => { throw new Error('窗口不存在'); };
+  await h.send('OPEN_RECORDER_WINDOW');
+  const recovered = await h.send('GET_STATE');
+  const restarted = await h.send('START_RECORDING', { source: 'window' });
+  ok(`${status} 聚焦失效后清理并可重新开始`, recovered.recorderWindowId === 0 &&
+    recovered.recorderTabId === 0 && recovered.processing === false && !restarted.error &&
+    (status === 'preparing' ? recovered.status === 'idle' : recovered.savePhase === 'error'),
+    JSON.stringify({ recovered, restarted }));
 }
 
 {

@@ -220,7 +220,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   return true; // 异步回复
 });
 
-async function route(msg) {
+async function route(msg, sender = {}) {
   await stateReady;   // 确保 SW 回收后已恢复 state
   switch (msg.type) {
 
@@ -303,11 +303,25 @@ async function route(msg) {
       if (state.mode !== 'desktop' || !state.recorderWindowId) {
         return { error: '当前没有可打开的录制窗口' };
       }
+      const windowId = state.recorderWindowId;
       try {
-        await chrome.windows.update(state.recorderWindowId, { focused: true });
-        return { ok: 1, windowId: state.recorderWindowId };
+        await chrome.windows.update(windowId, { focused: true });
+        return { ok: 1, windowId };
       } catch (_) {
-        return { error: '录制窗口已关闭或不可用' };
+        try {
+          await chrome.windows.get(windowId);
+          return { error: '录制窗口暂时无法聚焦' };
+        } catch (_) {
+          if (windowId !== state.recorderWindowId) return { error: '录制窗口已变化' };
+          setState({ recorderWindowId: 0, recorderTabId: 0 });
+          if (state.processing || state.status !== 'preparing' && state.status !== 'idle') {
+            markSaveContextLost('录制窗口已关闭，录制已中止');
+          } else if (state.status === 'preparing') {
+            setState({ status: 'idle', startTime: 0, processing: false });
+            badge('idle');
+          }
+          return { error: '录制窗口已关闭或不可用' };
+        }
       }
     }
 
@@ -382,6 +396,16 @@ async function route(msg) {
     /* ── 来自 offscreen / recorder 的事件 ─────────────── */
     case 'RECORDING_STOPPED':
     case 'RECORDER_STOPPED': {
+      if (msg.captureFailed && state.status === 'preparing' &&
+          state.mode === 'desktop' && state.recorderWindowId) {
+        resetSaveResult();
+        setState({
+          status: 'preparing', startTime: 0, pausedTime: 0, pauseStart: 0,
+          fileSize: 0, processing: false,
+        });
+        badge('preparing');
+        return { ok: 1 };
+      }
       setState({ status: 'idle', fileSize: 0, recorderWindowId: 0, recorderTabId: 0, processing: false });
       if (msg.discarded) {
         resetSaveResult();
@@ -443,14 +467,19 @@ async function route(msg) {
       }
       return { ok: 1 };
     case 'RECORDER_STARTED': {
-      if (state.status === 'preparing' || state.status === 'recording') {
-        setState({
-          status: 'recording',
-          startTime: Date.now(),
-          pausedTime: 0,
-        });
-        badge('recording');
+      const senderTabId = sender.tab && sender.tab.id;
+      if (state.mode !== 'desktop' || state.status !== 'preparing' || !state.recorderWindowId) {
+        return { error: '录制已开始或已取消' };
       }
+      if (state.recorderTabId && senderTabId && senderTabId !== state.recorderTabId) {
+        return { error: '录制窗口不匹配' };
+      }
+      setState({
+        status: 'recording',
+        startTime: Date.now(),
+        pausedTime: 0,
+      });
+      badge('recording');
       return { ok: 1 };
     }
     case 'FILE_SIZE_UPDATE':

@@ -429,5 +429,74 @@ await golden('200KB 负载 Cluster',
     webMClustersEqual(fixed, withAppendedCues));
 }
 
+async function expectOriginal(name, bytes) {
+  const raw = _fixWebMFullBuffer(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), 1500);
+  const legacy = Buffer.from(new Uint8Array(raw));
+  const streamed = Buffer.from(await (await _fixWebMStream(new Blob([bytes]), 1500, 64)).arrayBuffer());
+  ok(`${name}：legacy 原样返回`, legacy.equals(Buffer.from(bytes)));
+  ok(`${name}：streaming 原样返回`, streamed.equals(Buffer.from(bytes)));
+}
+
+/* 17. 缺少 Cluster Timestamp 不得用默认 0 猜测 CueTime */
+await expectOriginal('缺少 Cluster Timestamp', wrapDefinite([
+  info({}), tracks,
+  el(CLUSTER, simpleBlock({ track: 1, relative: 20, keyframe: true })),
+]));
+
+/* 18. Timestamp 晚到时只能使用其后 Block 的实际时间 */
+{
+  const bytes = wrapDefinite([
+    info({}), tracks,
+    el(CLUSTER, cat(
+      simpleBlock({ track: 1, relative: 20, keyframe: true }),
+      el(TIMECODE, uintBytes(1000)),
+      simpleBlock({ track: 1, relative: 30, keyframe: true }),
+    )),
+  ]);
+  const fixed = await golden('晚到的 Cluster Timestamp', bytes, 1500);
+  const report = checkWebMKeyframeCues(fixed);
+  ok('  · 晚到时间码前的 Block 不参与猜测', JSON.stringify(report.cueTimes) === '[1030]',
+    JSON.stringify(report.cueTimes));
+}
+
+/* 19. BlockGroup 尾部截断，不能凭前半段猜关键帧 */
+await expectOriginal('截断的 ReferenceBlock', wrapDefinite([
+  info({}), tracks,
+  el(CLUSTER, cat(
+    el(TIMECODE, uintBytes(0)),
+    el(BLOCK_GROUP, cat(
+      mediaBlock(BLOCK, { track: 1, relative: 20, keyframe: true }),
+      new Uint8Array([0xFB]),
+    )),
+  )),
+]));
+
+/* 20. unknown-size Cluster 与大音频负载同时出现时，读取仍有界 */
+{
+  const bytes = wrapUnknown([
+    info({}), tracks,
+    cat(elUnknown(CLUSTER), cat(
+      el(TIMECODE, uintBytes(0)),
+      simpleBlock({ track: 2, payload: new Uint8Array(400 * 1024).fill(0x5A) }),
+      simpleBlock({ track: 1, relative: 20, keyframe: true }),
+    )),
+    cluster(4000),
+  ]);
+  const source = new Blob([bytes]);
+  const reads = [];
+  const slice = source.slice.bind(source);
+  source.slice = (start = 0, end = source.size) => {
+    const part = slice(start, end);
+    const readPart = part.arrayBuffer.bind(part);
+    part.arrayBuffer = async () => { reads.push([start, end]); return readPart(); };
+    return part;
+  };
+  await _fixWebMStream(source, 4500, 65536);
+  const total = reads.reduce((sum, [start, end]) => sum + end - start, 0);
+  ok('unknown-size Cluster 大音频不整段物化或重复全扫',
+    reads.every(([start, end]) => end - start <= 65536 && end - start < bytes.length) &&
+    total <= bytes.length + 2 * 65536, JSON.stringify(reads));
+}
+
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n全部通过 🎉');
 process.exit(failed ? 1 : 0);

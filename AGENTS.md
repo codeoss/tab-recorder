@@ -75,6 +75,8 @@ core-recorder.js      # 公共录制引擎 createRecorderEngine({ getStream, onE
 fix-webm.js           # 手写 EBML 解析器：补 SeekHead + 只为真实视频关键帧重建 Cues + 修补 Duration。
                       # 从 Tracks 识别视频轨；SimpleBlock 看 keyframe 位，BlockGroup 看 ReferenceBlock；
                       # CueTime=Cluster.Timecode+Block 相对时间码，CueTrack 为真实视频轨号。
+                      # 必须有合法 Cluster.Timestamp；BlockGroup 子元素须完整解析到组尾，
+                      # 缺失/晚到时间码前的 Block、截断 ReferenceBlock 均不猜关键帧。
                       # SeekPosition/CueClusterPosition 均相对 Segment 数据区；头部插入统一计位移。
                       # 流式实现（生产路径）：256KB 滑窗扫描 + 稀疏编辑 + Blob.slice 拼装，
                       # 跳过音频/媒体负载，内存 O(窗口+Cues)；legacy 全量实现保留为 golden 对照
@@ -99,11 +101,11 @@ icons/                # 16/48/128 PNG 图标
 
 ## 消息协议（改代码时保持兼容）
 
-- `state.status`：`idle | preparing | countdown | recording | paused`。desktop/compat 创建 recorder 窗口后是 `preparing` 且 `startTime=0`，选择期间不累计录制时长；`RECORDER_STARTED` 才转为 `recording` 并写实际开始时间。准备中 STOP 关闭等待窗口，不进入保存链
+- `state.status`：`idle | preparing | countdown | recording | paused`。desktop/compat 创建 recorder 窗口后是 `preparing` 且 `startTime=0`，选择期间不累计录制时长；原生取流取消/失败（`captureFailed:true`）保持 preparing 和原窗口 ID，支持同窗口重试。`RECORDER_STARTED` 仅接受当前 desktop 窗口的 preparing→recording 转换，重复/错误来源不重置计时。准备中 STOP 关闭等待窗口，不进入保存链；聚焦失效经 `windows.get` 确认后清理并允许重开
 - popup → background：`START_RECORDING`（带 `source: 'tab'|'window'|'screen'`、`compatMode`、分辨率/fps/quality/timeLimit/outputFormat/countdownSec 等；非 idle 或保存处理中时会被拒绝——重入守卫）、`STOP/PAUSE/RESUME/DISCARD_RECORDING`、`GET_STATE`（1.5s 轮询）、`OPEN_SAVE_WINDOW`、`RETRY_SAVE`、**desktop/compat 只用 `OPEN_RECORDER_WINDOW` 聚焦原 recorder 窗口，不重复提供停止/暂停入口**
 - background → 录制引擎：`OFF_START`（仅 offscreen，带 `tabId`）、`OFF_STOP`、`OFF_PAUSE`、`OFF_RESUME`、`OFF_DISCARD`、`OFF_RETRY_SAVE`。tab 模式经 `chrome.runtime.sendMessage`（带 `target: 'offscreen'` 过滤）；desktop 模式经 `chrome.tabs.sendMessage(recorderTabId, ...)`。streamId 不随 OFF_START 下发：`getMediaStreamId` 的 id 应尽快消费，引擎在倒计时/选屏结束后才发 `GET_STREAM_ID`（带 tabId）现取现用
 - 引擎保存文件：`save-file.js` 创建 Blob URL 并发 `SAVE_FILE {url, filename}` 给 background，随后每秒 `GET_DOWNLOAD_STATUS {downloadId}` 直到 complete/interrupted；background 返回真实文件名、路径和 received/total
-- 引擎 → background：offscreen 发 `RECORDING_STOPPED`、`FILE_SIZE_UPDATE`、`COUNTDOWN_TICK`、`ENGINE_PROCESSING`（含 stage）、`ENGINE_SAVE_ERROR`；recorder 窗口发 `RECORDER_STARTED`、`RECORDER_STOPPED`、`FILE_SIZE_UPDATE`、`ENGINE_PROCESSING`、`ENGINE_SAVE_ERROR`、`ENGINE_PAUSED`/`ENGINE_RESUMED`。停止时带 `historyEntry`（仅在下载 complete 后）与可选 `discarded`
+- 引擎 → background：offscreen 发 `RECORDING_STOPPED`、`FILE_SIZE_UPDATE`、`COUNTDOWN_TICK`、`ENGINE_PROCESSING`（含 stage）、`ENGINE_SAVE_ERROR`；recorder 窗口发 `RECORDER_STARTED`、`RECORDER_STOPPED`、`FILE_SIZE_UPDATE`、`ENGINE_PROCESSING`、`ENGINE_SAVE_ERROR`、`ENGINE_PAUSED`/`ENGINE_RESUMED`。停止时带 `historyEntry`（仅在下载 complete 后）与可选 `discarded`；取流取消/失败另带 `captureFailed:true`，与最终 stopped 区分
 
 引擎内部事件（`onEvent` 回调）：`started / paused / resumed / tick / size / processing({active,stage}) / saveerror / stopped / saved`。
 
