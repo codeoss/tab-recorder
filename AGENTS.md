@@ -89,6 +89,7 @@ mp4-faststart.js      # 常规 MP4 faststart + 已 faststart fMP4 的 mvhd/tkhd/
                       # 只读 moov/moof（tfhd/tfdt/trun/trex），mdat/moof/mfra 原样保留；
                       # 内存 O(moov+单个 moof+分片元数据)，GB 级长视频可用（替代 wasm 方案）
                       # 分片 moov-at-end 的纯 JS 支持仍是待办：docs/todo/moov-at-end-fmp4.md
+                      # 旧版 ffprobe 对零样本 trun 的失败根因见 docs/todo/zero-sample-trun-legacy-ffprobe.md
                       # 注释为英文（移植自 ScreenCap Pro v1.4.1），修改时保持英文注释风格
 transcoder.js         # ffmpeg 主线程入口（懒加载）：webmToMp4(blob) / mp4Faststart(blob)，
                       # 内部把任务 postMessage 给 worker；超时随输入大小缩放，超时 terminate 重建
