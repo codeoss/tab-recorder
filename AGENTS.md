@@ -14,6 +14,7 @@
 - 输出 **WebM**（内置 SeekHead/关键帧 Cues/Duration 修复，Chrome 与 WMP 可拖动），原生 **MP4**（faststart + fMP4 时长重建），老 Chrome 可选 ffmpeg.wasm 转码
 - **窗口/屏幕/兼容模式统一在 recorder 操作**：准备阶段不提前计时，实际开始后才计时；主 popup 显示状态并聚焦原窗口
 - **保存状态全程可见**：独立保存窗口 / recorder 窗口 / popup 同步；真实下载 complete 后才显示已保存并写历史，失败可重试或明确丢弃
+- **长录制持续暂存与异常恢复**：Worker 同步写 OPFS 并逐分片 flush；offscreen/浏览器异常后可恢复到最后确认分片
 
 **完全离线，无任何数据上传。无 host_permissions，无 `tabs` 权限。**
 
@@ -69,9 +70,14 @@ recorder.html / recorder.js     # 窗口/屏幕/兼容模式录制窗口。URL h
 save-status.html / save-status.js # 标签页专用可见保存窗口：阶段、真实进度、完成、失败重试/丢弃
 save-file.js          # Blob URL 适配器：runtime 交 background 下载，轮询终态后才 revoke
 core-recorder.js      # 公共录制引擎 createRecorderEngine({ getStream, onEvent, releaseExtra, saveFile })。
-                      # MediaRecorder 生命周期、分片累积、定时停止；onStopped 异步链：
-                      # fix-webm / MP4 处理 → await 下载 complete → saved/history；
-                      # 失败保留最终 Blob，retrySave 只重试下载，明确丢弃才释放
+                      # MediaRecorder 生命周期、启动代次、有界待写队列、定时停止；onStopped 异步链：
+                      # 等最后分片确认 → fix-webm / MP4 处理 → await 下载 complete → saved/history；
+                      # 失败保留最终 Blob 与 OPFS，retrySave 只重试下载，明确丢弃才释放
+durable-recorder.js   # createDurableWriter：最多 4 个/32MiB 待确认分片，元数据等待 background 确认
+durable-writer-worker.js # OPFS createSyncAccessHandle 追加、逐片 flush、确认偏移、finalize/discard；
+                      # 不用普通 createWritable 做崩溃暂存（未关闭时探针实测重启为 0 字节）
+recovery.js           # recoverDurableBlob：WebM 调 fixWebMRecoveryBlob；MP4 只读 box 头裁去不完整尾部，
+                      # 需完整 moof + 非空 mdat，否则拒绝假成功；deleteDurableFile 负责明确清理
 fix-webm.js           # 手写 EBML 解析器：补 SeekHead + 只为真实视频关键帧重建 Cues + 修补 Duration。
                       # 从 Tracks 识别视频轨；SimpleBlock 看 keyframe 位，BlockGroup 看 ReferenceBlock；
                       # CueTime=Cluster.Timecode+Block 相对时间码，CueTrack 为真实视频轨号。
@@ -100,7 +106,7 @@ icons/                # 16/48/128 PNG 图标
 ```
 
 **HTML 脚本加载顺序是硬性依赖**（offscreen.html 与 recorder.html 一致）：
-`fix-webm.js` → `mp4-faststart.js` → `transcoder.js` → `save-file.js` → `core-recorder.js` → 上下文脚本（`offscreen.js` / `recorder.js`）。core-recorder 运行期依赖前两者暴露的全局 `fixWebMBlob` / `mp4FaststartJs` / `webmToMp4` / `mp4Faststart`，并由宿主注入 `saveFile: saveFileViaBackground`。
+`fix-webm.js` → `mp4-faststart.js` → `transcoder.js` → `save-file.js` → `durable-recorder.js` → `recovery.js`（offscreen）→ `core-recorder.js` → 上下文脚本（`offscreen.js` / `recorder.js`）。core-recorder 依赖 `fixWebMBlob` / `fixWebMRecoveryBlob` / `createDurableWriter` / `mp4FaststartJs` / `webmToMp4` / `mp4Faststart`，并由宿主注入 `saveFile: saveFileViaBackground`。
 
 ## 消息协议（改代码时保持兼容）
 
@@ -109,8 +115,10 @@ icons/                # 16/48/128 PNG 图标
 - background → 录制引擎：`OFF_START`（仅 offscreen，带 `tabId`）、`OFF_STOP`、`OFF_PAUSE`、`OFF_RESUME`、`OFF_DISCARD`、`OFF_RETRY_SAVE`。tab 模式经 `chrome.runtime.sendMessage`（带 `target: 'offscreen'` 过滤）；desktop 模式经 `chrome.tabs.sendMessage(recorderTabId, ...)`。streamId 不随 OFF_START 下发：`getMediaStreamId` 的 id 应尽快消费，引擎在倒计时/选屏结束后才发 `GET_STREAM_ID`（带 tabId）现取现用
 - 引擎保存文件：`save-file.js` 创建 Blob URL 并发 `SAVE_FILE {url, filename}` 给 background，随后每秒 `GET_DOWNLOAD_STATUS {downloadId}` 直到 complete/interrupted；background 返回真实文件名、路径和 received/total
 - 引擎 → background：offscreen 发 `RECORDING_STOPPED`、`FILE_SIZE_UPDATE`、`COUNTDOWN_TICK`、`ENGINE_PROCESSING`（含 stage）、`ENGINE_SAVE_ERROR`；recorder 窗口发 `RECORDER_STARTED`、`RECORDER_STOPPED`、`FILE_SIZE_UPDATE`、`ENGINE_PROCESSING`、`ENGINE_SAVE_ERROR`、`ENGINE_PAUSED`/`ENGINE_RESUMED`。停止时带 `historyEntry`（仅在下载 complete 后）与可选 `discarded`；取流取消/失败另带 `captureFailed:true`，与最终 stopped 区分
+- 持续暂存：`durable` → `DURABLE_UPDATE {patch}`，background await 写入 `chrome.storage.local.durableRecording` 后才确认 append；不同 id 不得覆盖。清理顺序：停止更新 → 等 writer 删除 OPFS → `DURABLE_CLEANUP` 按 id 删元数据 → stopped。清理失败不得伪造成功。`SAVE_FILE` 先持久化含 Blob URL 的 downloadIntent，再立即写 downloadId，覆盖 id 尚未落盘的崩溃窗口
+- 异常恢复：popup/save-status 发 `RECOVER_RECORDING` / `DISCARD_RECOVERY`；background 共用 `recoveryInFlight` 互斥，先对账已有下载，再经 offscreen `OFF_RECOVER_RECORDING` / `OFF_DISCARD_RECOVERY`。offscreen 另发独立 `RECOVERY_COMPLETE`，SW 重启后主动接续，完成不依赖原消息通道。`historyEntry.recordingId` 去重。只有无存活 owner 才开放恢复；desktop 窗口销毁同样检查暂存
 
-引擎内部事件（`onEvent` 回调）：`started / paused / resumed / tick / size / processing({active,stage}) / saveerror / stopped / saved`。
+引擎内部事件（`onEvent` 回调）：`started / paused / resumed / tick / size / durable / processing({active,stage}) / saveerror / stopped / saved`。
 
 ## MP4 输出（可选，三档自动降级）
 
@@ -132,10 +140,10 @@ cp node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.{js,wasm} lib/ffmpeg/
 ## 测试与验证
 
 **E2E 测试在 `e2e/`**（Playwright + 系统 X11 + xdotool）：`cd e2e && npm i && npm test`。
-- 单元：`unit-webmstream.mjs`（SeekHead/Cue 落点与实际视频关键帧）、`unit-mp4faststart.mjs`、`unit-native-mp4.mjs`、`unit-save-state.mjs`、`unit-save-engine.mjs`、`unit-save-ui.mjs`、`unit-popup-save.mjs`、`unit-popup-recorder.mjs`（准备态/实际计时/单一入口）、`unit-recorder-save.mjs`。
-- 场景 A–E：完整录制、倒计时取消竞态、暂停中停止、原生 MP4、保存状态可见（延迟下载、popup 关闭、失败重试、明确丢弃）。
+- 单元：`unit-webmstream.mjs`（含异常尾部恢复）、`unit-mp4faststart.mjs`、`unit-native-mp4.mjs`、`unit-durable-writer.mjs`（真实 Worker + fake OPFS）、`unit-recovery.mjs`（MP4 完整分片/假成功防护）、`unit-save-state.mjs`、`unit-save-engine.mjs`、`unit-save-ui.mjs`、`unit-popup-save.mjs`、`unit-popup-recorder.mjs`、`unit-recorder-save.mjs`。
+- 场景 A–E：完整录制、倒计时取消竞态、暂停中停止、原生 MP4、保存状态可见；`run-recovery.mjs` 另测 WebM/MP4 强杀重启、offscreen 销毁、重复恢复和明确丢弃，FFmpeg 完整解码且 WebM 不得有 `File ended prematurely`。
 - Windows 没有 xdotool/WSL 时，可用 `E2E_MANUAL_SHORTCUT=1` 留出真实 Ctrl+Shift+E 按键窗口；`NATIVE_CHROME_BIN` 指定品牌 Chrome 做原生 MP4 测试。默认 Linux 路径与行为不变。
-- 品牌版 Chrome ≥137 禁用 `--load-extension`（E2E 用 Playwright 自带 Chromium/CfT）；CfT 上 offscreen 偶发被提前回收（rig 局限，生产无此问题）。详见 `e2e/run.mjs` 头部注释。
+- 品牌版 Chrome ≥137 禁用 `--load-extension`（E2E 用 Playwright 自带 Chromium/CfT）；CfT 上 offscreen 偶发被提前回收，且管理策略会在真实 reload 后禁用侧载扩展，恢复 E2E 对此明确 SKIP，不能宣称真实 reload 已覆盖。详见 `e2e/run.mjs` / `run-recovery.mjs`。
 
 **手工验证仍不可替代**（云桌面兼容模式等需要真实 RDP 环境）：
 - 静态检查：改完 JS 可用 `node --check <file>` 验证语法（注意 worker/offscreen 里的 `chrome.*` API 在 node 下不存在，仅做语法检查）
@@ -143,7 +151,7 @@ cp node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.{js,wasm} lib/ffmpeg/
   - WebM/MP4 在 Windows 媒体播放器前中后段拖动；WebM 不应先花屏。可用 Media Foundation 的 `CAN_SEEK`、`MF_PD_DURATION` 和 seek 后样本时间作客观对照，并用独立校验器检查全部 Cue 的视频关键帧
   - desktop/compat 选择画面和音频期间不提前计时；控制只在 recorder 窗口；定时停止、切换分辨率、兼容模式系统音频
   - 停止后关闭 popup 的保存可见性、失败重试、明确丢弃、service worker 回收后恢复
-  - 尝试关闭保存窗口/Chrome，确认 beforeunload 边界；强制退出仍可能丢文件，不承诺绝对防丢
+  - 尝试关闭保存窗口/Chrome，确认 beforeunload 与 OPFS 恢复；最后未确认分片、存储清除/断电仍可能丢数据，不承诺绝对防丢
 
 ## 代码风格约定
 

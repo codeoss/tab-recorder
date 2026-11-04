@@ -88,7 +88,7 @@ ok('保存中 beforeunload 保持保护', !!busyEvent.returnValue);
 test.onEvent('saveerror', { message: 'FILE_NO_SPACE' });
 ok('可恢复失败显示重试和丢弃', el('retrySaveBtn') && el('retrySaveBtn').hidden === false &&
    el('discardSaveBtn') && el('discardSaveBtn').hidden === false &&
-   el('stxt').textContent.includes('文件仍在内存'));
+   el('stxt').textContent.includes('文件仍保留'));
 await el('retrySaveBtn').click();
 await el('discardSaveBtn').click();
 ok('重试和丢弃调用真实引擎方法', retries === 1 && discards === 1);

@@ -88,7 +88,7 @@ patch('core-recorder.js', `          if (recorder && recorder.state !== 'inactiv
 patch('core-recorder.js', `        recorder.stop();`,
   RELAY(`'engine.stop state='+(recorder&&recorder.state)`) + '\n', { prepend: true });
 patch('core-recorder.js', `      releaseAll(); stopTick();\n      isProcessing = true;`,
-  RELAY(`'onStopped enter chunks='+chunks.length`) + '\n', { prepend: true });
+  RELAY(`'onStopped enter durableBytes='+(durableWriter&&durableWriter.bytes)`) + '\n', { prepend: true });
 patch('core-recorder.js', `      await persistFinalBlob();`,
   RELAY(`'onStopped before-save'`) + '\n', { prepend: true });
 patch('core-recorder.js', `      emit('started', { timeLimit: opts.timeLimit || 0 });`,
@@ -98,8 +98,8 @@ patch('offscreen.js', `  const gen = ++startGen;`,
   `  const gen = ++startGen;\n  ${RELAY(`'doStart gen='+gen+' busy='+(engine&&engine.isBusy())`)}`);
 patch('offscreen.js', `    OFF_STOP:    () => { startGen++; if (engine) engine.stop();    return { ok: 1 }; },`,
   `    OFF_STOP:    () => { startGen++; ${RELAY(`'OFF_STOP gen='+startGen+' engine='+!!engine`)} if (engine) engine.stop();    return { ok: 1 }; },`);
-patch('offscreen.js', `    OFF_DISCARD: () => { startGen++; if (engine) engine.discard(); return { ok: 1 }; },`,
-  `    OFF_DISCARD: () => { startGen++; ${RELAY(`'OFF_DISCARD gen='+startGen+' engine='+!!engine`)} if (engine) engine.discard(); return { ok: 1 }; },`);
+patch('offscreen.js', `    OFF_DISCARD: () => { startGen++; return engine ? engine.discard().then(() => ({ ok: 1 })) : { ok: 1 }; },`,
+  `    OFF_DISCARD: () => { startGen++; ${RELAY(`'OFF_DISCARD gen='+startGen+' engine='+!!engine`)} return engine ? engine.discard().then(() => ({ ok: 1 })) : { ok: 1 }; },`);
 
 // 保存链路专用门闩（仅测试副本）：延迟下载或模拟一次中断，生产代码零改动。
 // 标志放 storage.session，避免 service worker 在保存途中回收后丢失故障注入条件。
@@ -122,7 +122,7 @@ patch('save-file.js', `      const started = await chrome.runtime.sendMessage({ 
       const started = await chrome.runtime.sendMessage({ type: 'SAVE_FILE', url, filename });`);
 
 // 注入后自检：语法坏掉会让 offscreen 整页失效且极难排查，这里直接 fail-fast
-for (const f of ['core-recorder.js', 'offscreen.js', 'recorder.js', 'background.js', 'popup.js', 'save-file.js', 'save-status.js']) {
+for (const f of ['core-recorder.js', 'durable-recorder.js', 'durable-writer-worker.js', 'offscreen.js', 'recorder.js', 'background.js', 'popup.js', 'save-file.js', 'save-status.js']) {
   execFileSync(process.execPath, ['--check', path.join(BUILD, f)]);
 }
 
@@ -521,7 +521,7 @@ try {
   // 保存状态页是异步渲染的（load 后先拉 GET_STATE），找到页面时首帧
   // 可能还是占位内容——先等错误态渲出来再断言（实测快慢机器上时序不同）
   await savePage.locator('#retryBtn').waitFor({ state: 'visible', timeout: 15000 });
-  ok('失败显示可重试且历史不增加', (await savePage.locator('body').innerText()).includes('文件仍在内存') &&
+  ok('失败显示可重试且历史不增加', (await savePage.locator('body').innerText()).includes('文件仍保留') &&
      (await historyLength()) === historyBeforeE + 1);
   ok('重试按钮可见且可用', await savePage.locator('#retryBtn').isVisible());
   await setSaveGate(false, false);

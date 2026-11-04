@@ -21,6 +21,42 @@
 let audioCtx = null;
 let engine = null;
 let startGen = 0;   // 启动代次：每次新启动或取消都递增，旧代次的 pending 启动自动失效
+let recoveryPromise = null;
+
+function recoverRecording(metadata) {
+  if (recoveryPromise) return recoveryPromise;
+  recoveryPromise = (async () => {
+    const recovered = await recoverDurableBlob(metadata);
+    const saved = await saveFileViaBackground(recovered.blob, recovered.filename);
+    await deleteDurableFile(metadata);
+    const result = {
+      ok: 1,
+      historyEntry: {
+        filename: saved.filename || recovered.filename,
+        size: recovered.blob.size,
+        duration: fmtRecoveryDuration(recovered.durMs),
+        date: new Date().toLocaleString('zh-CN'),
+        format: recovered.blob.type.includes('mp4') ? 'mp4' : 'webm',
+        recordingId: metadata.id,
+      },
+    };
+    notify('RECOVERY_COMPLETE', { historyEntry: result.historyEntry });
+    return result;
+  })();
+  recoveryPromise.catch(() => { recoveryPromise = null; });
+  return recoveryPromise;
+}
+
+async function discardRecovery(metadata) {
+  await deleteDurableFile(metadata);
+  return { ok: 1 };
+}
+
+function fmtRecoveryDuration(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return [Math.floor(seconds / 3600), Math.floor((seconds % 3600) / 60), seconds % 60]
+    .map(value => String(value).padStart(2, '0')).join(':');
+}
 
 /* ── 消息处理：把 background 的 OFF_* 转成 engine 方法 ── */
 
@@ -32,8 +68,10 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     OFF_STOP:    () => { startGen++; if (engine) engine.stop();    return { ok: 1 }; },
     OFF_PAUSE:   () => { engine && engine.pause();   return { ok: 1 }; },
     OFF_RESUME:  () => { engine && engine.resume();  return { ok: 1 }; },
-    OFF_DISCARD: () => { startGen++; if (engine) engine.discard(); return { ok: 1 }; },
+    OFF_DISCARD: () => { startGen++; return engine ? engine.discard().then(() => ({ ok: 1 })) : { ok: 1 }; },
     OFF_RETRY_SAVE: () => engine ? engine.retrySave() : Promise.resolve(false),
+    OFF_RECOVER_RECORDING: () => recoverRecording(msg.metadata),
+    OFF_DISCARD_RECOVERY: () => discardRecovery(msg.metadata),
   };
   const fn = h[msg.type];
   if (!fn) return false;
@@ -118,6 +156,8 @@ function onEvent(name, data) {
       });
       break;
     case 'size':     notify('FILE_SIZE_UPDATE',  { size: data.bytes }); break;
+    case 'durable':  return notifyCritical('DURABLE_UPDATE', { patch: data });
+    case 'durablecleanup': return notifyCritical('DURABLE_CLEANUP', { id: data && data.id });
     case 'processing':
       notify('ENGINE_PROCESSING', { active: !!(data && data.active), stage: data && data.stage });
       break;
@@ -136,6 +176,12 @@ function onEvent(name, data) {
 
 function notify(type, extra) {
   try { chrome.runtime.sendMessage({ type, ...extra }).catch(() => {}); } catch (_) {}
+}
+
+async function notifyCritical(type, extra) {
+  const result = await chrome.runtime.sendMessage({ type, ...extra });
+  if (!result || result.error) throw new Error((result && result.error) || '元数据未保存');
+  return result;
 }
 
 function releaseAudioCtx() {

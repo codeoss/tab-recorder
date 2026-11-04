@@ -99,6 +99,17 @@ if (!fs.existsSync(SCRIPT)) {
   fatal.listeners.beforeunload?.(fatalEvent);
   ok('不可恢复错误不提供假重试', fatal.elements.retryBtn.hidden &&
      fatal.elements.detail.textContent.includes('无法重试') && !fatalEvent.returnValue);
+
+  const recovery = page({ status: 'idle', processing: false, savePhase: '',
+    recoveryAvailable: true, recoveryBusy: false, durableBytes: 100 });
+  await flush();
+  ok('重启恢复入口明确且不把暂存称为已保存', recovery.elements.title.textContent.includes('未完成') &&
+    !recovery.elements.retryBtn.hidden && !recovery.elements.discardBtn.hidden &&
+    !recovery.elements.title.textContent.includes('已保存'));
+  await recovery.elements.retryBtn.click();
+  await recovery.elements.discardBtn.click();
+  ok('恢复页面发送恢复与明确丢弃命令', recovery.messages.some(x => x.type === 'RECOVER_RECORDING') &&
+    recovery.messages.some(x => x.type === 'DISCARD_RECOVERY'));
 }
 
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n保存页面测试全部通过 🎉');

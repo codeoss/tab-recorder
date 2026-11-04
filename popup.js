@@ -32,6 +32,7 @@ let poll = null;
 let bgStart = 0, bgPaused = 0, bgLimit = 0;
 let wasProcessing = false;   // 上次轮询时引擎是否在保存/转码（用于完成时刻刷历史）
 let saveActive = false;      // 保存/下载/可重试失败期间，禁止开始与修改设置
+let recoveryMode = false;
 
 /* ── 初始化 ──────────────────────────────────────────── */
 
@@ -47,7 +48,7 @@ function events() {
   el.discard.addEventListener('click', discard);
   el.openSaveBtn.addEventListener('click', () => send('OPEN_SAVE_WINDOW'));
   el.retrySaveBtn.addEventListener('click', async () => {
-    const res = await send('RETRY_SAVE');
+    const res = await send(recoveryMode ? 'RECOVER_RECORDING' : 'RETRY_SAVE');
     if (res && res.error) status('pau', res.error);
     await pollState();
   });
@@ -135,7 +136,7 @@ async function restore() {
       if (state === 'recording') { startTick(); showLimit(); }
       else if (state === 'preparing') { stopTick(); hideLimit(); }
       else showLimit();
-      if (bg.fileSize > 0) el.size.textContent = fmtMB(bg.fileSize);
+      if (bg.fileSize > 0) el.size.textContent = '已暂存 ' + fmtMB(bg.fileSize);
     }
     if (bg) renderSaveState(bg);
   } catch (_) {}
@@ -241,7 +242,7 @@ async function togglePause() {
 async function discard() {
   if (!confirm('确定丢弃此次录制？')) return;
   let result;
-  try { result = await send('DISCARD_RECORDING'); }
+  try { result = await send(recoveryMode ? 'DISCARD_RECOVERY' : 'DISCARD_RECORDING'); }
   catch (error) { result = { error: error.message }; }
   if (!result || result.error || result.ok === 0) {
     let bg = null;
@@ -290,7 +291,7 @@ async function pollState() {
     const bg = await send('GET_STATE');
     if (!bg) return;
     recorderWindowMode = bg.mode === 'desktop';
-    if (bg.fileSize > 0 && state !== 'idle') el.size.textContent = fmtMB(bg.fileSize);
+    if (bg.fileSize > 0 && state !== 'idle') el.size.textContent = '已暂存 ' + fmtMB(bg.fileSize);
 
     if (bg.status === 'preparing') {
       el.cdOvl.classList.add('hidden');
@@ -338,11 +339,23 @@ async function pollState() {
 
 function renderSaveState(bg) {
   const phase = bg.savePhase || (bg.processing ? 'processing' : '');
-  saveActive = !!bg.processing || (phase === 'error' && !!bg.saveCanRetry);
-  el.savePanel.classList.toggle('hidden', !phase);
-  el.openSaveBtn.hidden = !(bg.mode === 'tab' && (bg.processing || phase === 'error'));
-  el.retrySaveBtn.hidden = !(phase === 'error' && bg.saveCanRetry);
+  recoveryMode = !!bg.recoveryAvailable && bg.status === 'idle';
+  saveActive = recoveryMode || !!bg.processing || (phase === 'error' && !!bg.saveCanRetry);
+  el.savePanel.classList.toggle('hidden', !(phase || recoveryMode));
+  el.openSaveBtn.hidden = !(recoveryMode || (bg.mode === 'tab' && (bg.processing || phase === 'error')));
+  el.retrySaveBtn.textContent = recoveryMode ? '恢复保存' : '重试保存';
+  el.retrySaveBtn.hidden = recoveryMode
+    ? !!bg.recoveryBusy || phase === 'processing' || phase === 'downloading'
+    : !(phase === 'error' && bg.saveCanRetry);
   el.discardSaveBtn.hidden = el.retrySaveBtn.hidden;
+  if (recoveryMode && !bg.recoveryBusy && phase !== 'processing' && phase !== 'downloading') {
+    el.saveText.textContent = phase === 'error'
+      ? '恢复失败：' + (bg.saveError || '未知错误') : '发现未完成的录制';
+    el.saveProgress.textContent = `已暂存 ${fmtMB(bg.durableBytes)}，尚未下载；可恢复保存或明确丢弃`;
+    ui();
+    status(phase === 'error' ? 'pau' : 'rdy', phase === 'error' ? '恢复失败，可重试' : '录制尚未保存，请恢复或丢弃');
+    return;
+  }
   if (!phase) { ui(); return; }
 
   let title = '';
@@ -355,7 +368,7 @@ function renderSaveState(bg) {
     statusText = '录制完成';
   } else if (phase === 'error') {
     title = '保存失败：' + (bg.saveError || '未知错误') + (bg.saveCanRetry ? '' : '（无法重试）');
-    detail = bg.saveCanRetry ? '文件仍在内存，可重试或明确丢弃' : '保存上下文已关闭，无法重试';
+    detail = bg.saveCanRetry ? '文件仍保留，可重试或明确丢弃' : '保存上下文已关闭，无法重试';
     statusType = 'pau';
     statusText = bg.saveCanRetry ? '保存失败，可重试' : '保存上下文已关闭';
   } else {
@@ -365,7 +378,8 @@ function renderSaveState(bg) {
       transcode: '正在转码',
       download: '正在保存到下载目录',
     };
-    title = phase === 'downloading' ? '正在保存到下载目录' : (stages[bg.processingStage] || '正在整理视频');
+    title = recoveryMode ? '正在恢复并保存'
+      : phase === 'downloading' ? '正在保存到下载目录' : (stages[bg.processingStage] || '正在整理视频');
     if (phase === 'downloading' && bg.saveTotal > 0) {
       const percent = Math.min(100, Math.floor(bg.saveReceived / bg.saveTotal * 100));
       detail = `${percent}% · ${fmtMB(bg.saveReceived)} / ${fmtMB(bg.saveTotal)}`;

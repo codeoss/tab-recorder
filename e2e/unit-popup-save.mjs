@@ -107,5 +107,16 @@ function popupWith(bg, responses = {}) {
     !test.el.savePanel.classList.contains('hidden'), test.el.stxt.textContent);
 }
 
+{
+  const { test } = popupWith({
+    status: 'idle', mode: '', processing: false, savePhase: '',
+    recoveryAvailable: true, recoveryBusy: false, durableBytes: 100,
+  });
+  await test.pollState();
+  ok('主弹窗显示未完成录制恢复入口', test.el.saveText.textContent.includes('未完成') &&
+    !test.el.retrySaveBtn.hidden && !test.el.discardSaveBtn.hidden && !test.el.openSaveBtn.hidden);
+  ok('恢复待处理时禁止新录制', test.el.rec.style.pointerEvents === 'none');
+}
+
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n主弹窗保存状态测试全部通过 🎉');
 process.exit(failed ? 1 : 0);

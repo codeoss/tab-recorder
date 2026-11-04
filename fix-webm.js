@@ -827,6 +827,8 @@
       timecodeScale: 1000000,
       videoTrack: 0,
       clusters: [],   // Verified video keyframes only
+      clusterBounds: [],
+      topLevelEnd: segDataStart,
     };
     let lastClusterTimecode = -1;
     let infoSeen = false;   // 幻影 Info 防护：只采信第一个且解析干净的 Info
@@ -899,6 +901,10 @@
       }
 
       if (elId.id === ID.CLUSTER) {
+        f.clusterBounds.push({
+          off: cur, dataOff, size: elSz.val,
+          sizeOff: szOff, sizeLen: elSz.len, unknown: elSz.unknown,
+        });
         const tcId = await rd.readId(dataOff);
         let timecodeMs = 0;
         if (tcId && tcId.id === ID.TIMECODE) {
@@ -928,15 +934,18 @@
             scan++;
           }
           cur = scan;
+          f.topLevelEnd = cur;
           continue;
         }
       }
 
       if (elSz.unknown) {
         cur = dataOff + 1;
+        f.topLevelEnd = cur;
         continue;
       }
       cur = dataOff + elSz.val;
+      f.topLevelEnd = cur;
     }
 
     return f;
@@ -1016,6 +1025,68 @@
   }
 
   /* ═══════════════════════════════════════════════════════
+     Recovery-only tail normalization
+     ═══════════════════════════════════════════════════════ */
+
+  async function fixWebMRecoveryBlob(blob, durationMs, confirmedBytes) {
+    if (!Number.isFinite(confirmedBytes) || confirmedBytes <= 0) {
+      throw new Error('Invalid confirmed byte boundary');
+    }
+    const total = Math.min(blob.size, Math.floor(confirmedBytes));
+    const source = blob.slice(0, total, blob.type || 'video/webm');
+    const rd = makeWindowReader(source, 1 << 18);
+    const f = await scanWebM(rd);
+    if (!f) return source;
+
+    const edits = [];
+    let end = Math.min(total, f.topLevelEnd);
+    const last = f.clusterBounds[f.clusterBounds.length - 1];
+    if (last) {
+      const declaredEnd = last.unknown ? total : last.dataOff + last.size;
+      if (declaredEnd >= total) {
+        let cursor = last.dataOff;
+        while (cursor < total) {
+          const childId = await rd.readId(cursor);
+          if (!childId) break;
+          const childSize = await rd.readSize(cursor + childId.len);
+          if (!childSize || childSize.unknown) break;
+          const childEnd = cursor + childId.len + childSize.len + childSize.val;
+          if (childEnd > total) break;
+          cursor = childEnd;
+        }
+        end = cursor === last.dataOff ? last.off : cursor;
+        if (end > last.off && (last.unknown || declaredEnd !== end)) {
+          edits.push({
+            off: last.sizeOff, deleteLen: last.sizeLen,
+            insert: encodeVintSizeFixed(end - last.dataOff, last.sizeLen),
+          });
+        }
+      } else if (f.topLevelEnd < total) {
+        end = f.topLevelEnd;
+      }
+    }
+
+    if (!f.segSzUnknown) {
+      edits.push({
+        off: f.segSzOff, deleteLen: f.segSzLen,
+        insert: encodeVintSizeFixed(end - f.segDataStart, f.segSzLen),
+      });
+    }
+
+    edits.sort((a, b) => a.off - b.off);
+    const parts = [];
+    let cursor = 0;
+    for (const edit of edits) {
+      if (edit.off > cursor) parts.push(source.slice(cursor, edit.off));
+      parts.push(edit.insert);
+      cursor = edit.off + edit.deleteLen;
+    }
+    if (cursor < end) parts.push(source.slice(cursor, end));
+    const normalized = new Blob(parts, { type: blob.type || 'video/webm' });
+    return await fixWebMStream(normalized, durationMs);
+  }
+
+  /* ═══════════════════════════════════════════════════════
      Public API
      ═══════════════════════════════════════════════════════ */
 
@@ -1030,6 +1101,7 @@
   }
 
   G.fixWebMBlob = fixWebMBlob;
+  G.fixWebMRecoveryBlob = fixWebMRecoveryBlob;
   // 仅供 e2e/unit-webmstream.mjs golden 对照（流式 vs 全量逐字节一致）。
   // 等价性验证一个版本周期后连同 fixWebM 一起删除。
   G._fixWebMFullBuffer = fixWebM;

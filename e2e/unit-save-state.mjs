@@ -14,10 +14,10 @@ function ok(name, condition, extra = '') {
   if (!condition) failed++;
 }
 
-function harness(initialState = null) {
+function harness(initialState = null, durableRecording = null) {
   const listeners = {};
   const session = initialState ? { recorderState: initialState } : {};
-  const local = {};
+  const local = durableRecording ? { durableRecording } : {};
   const sent = [];
   const items = new Map();
   const contexts = [{ contextType: 'OFFSCREEN_DOCUMENT' }];
@@ -55,8 +55,13 @@ function harness(initialState = null) {
         async set(values) { Object.assign(session, values); },
       },
       local: {
-        get(key, cb) { cb({ [key]: local[key] }); },
-        set(values, cb) { Object.assign(local, values); if (cb) cb(); },
+        get(key, cb) {
+          const result = { [key]: local[key] };
+          if (cb) { cb(result); return; }
+          return Promise.resolve(result);
+        },
+        async set(values, cb) { Object.assign(local, values); if (cb) cb(); },
+        async remove(key) { delete local[key]; },
       },
     },
     action: {
@@ -78,7 +83,12 @@ function harness(initialState = null) {
         items.set(id, item);
         return id;
       },
-      async search({ id }) { return items.has(id) ? [{ ...items.get(id) }] : []; },
+      async search(query) {
+        if (query.id) return items.has(query.id) ? [{ ...items.get(query.id) }] : [];
+        let found = [...items.values()];
+        if (query.startedAfter) found = found.filter(item => Date.parse(item.startTime || 0) >= Date.parse(query.startedAfter));
+        return found.map(item => ({ ...item }));
+      },
       async cancel() { throw new Error('下载不应被取消'); },
     },
   };
@@ -236,6 +246,16 @@ async function processing(h, stage = 'webm-fix') {
   const state = await h.send('GET_STATE');
   ok('offscreen 消失后清除僵尸保存状态', state.processing === false && state.savePhase === 'error' &&
      state.saveCanRetry === false && !h.local.recordingHistory?.length);
+}
+
+{
+  const h = harness({
+    status: 'recording', mode: 'tab', processing: false, savePhase: '', saveCanRetry: false,
+  }, recoveryMeta('context-lost'));
+  h.contexts.length = 0;
+  const state = await h.send('GET_STATE');
+  ok('录制中 offscreen 消失后提供真实恢复入口', state.status === 'idle' &&
+    state.recoveryAvailable === true && state.saveCanRetry === true);
 }
 
 {
@@ -444,6 +464,162 @@ for (const status of ['preparing', 'recording']) {
     recovered.recorderTabId === 0 && recovered.processing === false && !restarted.error &&
     (status === 'preparing' ? recovered.status === 'idle' : recovered.savePhase === 'error'),
     JSON.stringify({ recovered, restarted }));
+}
+
+function recoveryMeta(id = 'r1') {
+  return {
+    id, fileName: `tab-record-${id}.media`, mime: 'video/webm', outputFormat: 'webm',
+    recordedIsMp4: false, bytes: 100, mediaTimeMs: 1000, startedAt: 1700000000000,
+    phase: 'recording', downloadId: 0,
+  };
+}
+
+{
+  const h = harness({ status: 'recording', mode: 'tab', processing: false }, recoveryMeta('live'));
+  const state = await h.send('GET_STATE');
+  ok('存活 offscreen 录制不会被误判为异常恢复', state.recoveryAvailable === false);
+}
+
+{
+  const h = harness({ status: 'idle', mode: 'tab', processing: true,
+    savePhase: 'error', saveCanRetry: true, downloadId: 0 }, recoveryMeta('live-retry'));
+  h.respondWith(async msg => msg.type === 'OFF_RETRY_SAVE' ? true : { error: 'unexpected recovery' });
+  const result = await h.send('RETRY_SAVE');
+  ok('存活引擎下载失败仍走原 pendingSave 重试', result.ok === 1 &&
+    h.sent.some(msg => msg.type === 'OFF_RETRY_SAVE') &&
+    !h.sent.some(msg => msg.type === 'OFF_RECOVER_RECORDING'));
+}
+
+{
+  const h = harness(null, recoveryMeta('independent-complete'));
+  const result = await h.send('RECOVERY_COMPLETE', { historyEntry: {
+    filename: 'independent.webm', recordingId: 'independent-complete', size: 100, duration: '00:00:01',
+  } });
+  ok('独立完成事件无需原始请求通道', result.ok === 1 && !h.local.durableRecording &&
+    h.local.recordingHistory.length === 1);
+}
+
+{
+  const h = harness({ status: 'idle', mode: 'tab', processing: true, savePhase: 'downloading',
+    recoveryBusy: true, downloadId: 1, saveCanRetry: true },
+  { ...recoveryMeta('sw-restart'), phase: 'downloading', downloadId: 1 });
+  h.patch(1, { state: 'complete', bytesReceived: 100, filename: 'C:/Downloads/sw-restart.webm' });
+  await h.send('GET_STATE');
+  for (let i = 0; i < 30 && h.local.durableRecording; i++) await new Promise(resolve => setImmediate(resolve));
+  ok('SW 在恢复中重启后主动对账已有下载', !h.local.durableRecording &&
+    h.local.recordingHistory?.[0]?.filename === 'sw-restart.webm');
+}
+
+{
+  const h = harness({ status: 'recording', mode: 'desktop', recorderWindowId: 100,
+    recorderTabId: 200, processing: false }, recoveryMeta('desktop-lost'));
+  await h.listeners.windowRemoved(100);
+  const state = await h.send('GET_STATE');
+  ok('desktop 录制窗口销毁也提供磁盘恢复', state.recoveryAvailable === true && state.saveCanRetry === true);
+}
+
+{
+  const h = harness(null, recoveryMeta());
+  const state = await h.send('GET_STATE');
+  const started = await h.send('START_RECORDING', { source: 'window' });
+  ok('重启后发现可恢复录制', state.recoveryAvailable === true);
+  ok('恢复处理前禁止新录制', !!started.error);
+}
+
+{
+  const h = harness(null, recoveryMeta('concurrent'));
+  let finish;
+  let calls = 0;
+  h.respondWith(async msg => {
+    if (msg.type === 'OFF_RECOVER_RECORDING') {
+      calls++;
+      await new Promise(resolve => { finish = resolve; });
+      return { ok: 1, historyEntry: { filename: 'recovered.webm', recordingId: 'concurrent' } };
+    }
+    return { ok: 1 };
+  });
+  const first = h.send('RECOVER_RECORDING');
+  const second = h.send('RECOVER_RECORDING');
+  await new Promise(resolve => setImmediate(resolve));
+  finish?.();
+  const results = await Promise.all([first, second]);
+  ok('并发恢复只执行一次且共享结果', calls === 1 && results.every(result => result.ok === 1));
+  ok('恢复完成清理元数据且不重复历史', !h.local.durableRecording && h.local.recordingHistory.length === 1);
+}
+
+{
+  const h = harness(null, { ...recoveryMeta('downloaded'), phase: 'downloading', downloadId: 1 });
+  h.patch(1, { state: 'complete', bytesReceived: 100, filename: 'C:/Downloads/already.webm' });
+  const result = await h.send('RECOVER_RECORDING');
+  ok('已有下载 complete 直接对账完成', result.ok === 1 && !h.local.durableRecording &&
+    h.local.recordingHistory[0].filename === 'already.webm');
+  ok('已有下载完成不会再次恢复编码', !h.sent.some(msg => msg.type === 'OFF_RECOVER_RECORDING'));
+}
+
+{
+  const h = harness(null, { ...recoveryMeta('in-progress'), phase: 'downloading', downloadId: 1 });
+  h.patch(1, { state: 'in_progress', bytesReceived: 50, totalBytes: 100, filename: 'C:/Downloads/running.webm' });
+  const pending = h.send('RECOVER_RECORDING');
+  for (let i = 0; i < 20 && h.session.recorderState?.savePhase !== 'downloading'; i++) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  h.patch(1, { state: 'complete', bytesReceived: 100 });
+  const result = await pending;
+  ok('已有下载 in_progress 继续等待且不重复导出', result.ok === 1 &&
+    h.local.recordingHistory[0].filename === 'running.webm' &&
+    !h.sent.some(msg => msg.type === 'OFF_RECOVER_RECORDING'));
+}
+
+{
+  const h = harness(null, { ...recoveryMeta('interrupted'), phase: 'downloading', downloadId: 1 });
+  h.patch(1, { state: 'interrupted', error: 'FILE_NO_SPACE', filename: 'C:/Downloads/old.webm' });
+  h.respondWith(async msg => msg.type === 'OFF_RECOVER_RECORDING'
+    ? { ok: 1, historyEntry: { filename: 'retry-recovery.webm', recordingId: 'interrupted' } }
+    : { ok: 1 });
+  const result = await h.send('RECOVER_RECORDING');
+  ok('已有下载 interrupted 才重新恢复导出', result.ok === 1 &&
+    h.sent.some(msg => msg.type === 'OFF_RECOVER_RECORDING'));
+}
+
+{
+  const h = harness(null, recoveryMeta('failed'));
+  h.respondWith(async msg => msg.type === 'OFF_RECOVER_RECORDING'
+    ? { error: 'RECOVERY_DECODE_FAILED' } : { ok: 1 });
+  const result = await h.send('RECOVER_RECORDING');
+  const state = await h.send('GET_STATE');
+  ok('恢复失败保留暂存并允许重试', (result.error || '').includes('RECOVERY_DECODE_FAILED') &&
+    h.local.durableRecording && state.recoveryAvailable && state.saveCanRetry);
+  const discarded = await h.send('DISCARD_RECOVERY');
+  ok('明确丢弃恢复文件并清除状态', discarded.ok === 1 && !h.local.durableRecording &&
+    h.sent.some(msg => msg.type === 'OFF_DISCARD_RECOVERY'));
+}
+
+{
+  const intentAt = 1700000000000;
+  const h = harness(null, { ...recoveryMeta('intent'), phase: 'processing', downloadId: 0,
+    downloadIntent: { filename: 'intent.webm', startedAt: intentAt } });
+  h.patch(1, { state: 'complete', bytesReceived: 100, filename: 'C:/Downloads/intent.webm',
+    startTime: new Date(intentAt + 10).toISOString() });
+  const result = await h.send('RECOVER_RECORDING');
+  ok('downloadId 未落盘时通过 intent 对账原下载', result.ok === 1 &&
+    h.local.recordingHistory?.[0]?.filename === 'intent.webm' &&
+    !h.sent.some(msg => msg.type === 'OFF_RECOVER_RECORDING'));
+}
+
+{
+  const h = harness(null, recoveryMeta('mutex'));
+  let finish;
+  h.respondWith(async msg => {
+    if (msg.type === 'OFF_DISCARD_RECOVERY') await new Promise(resolve => { finish = resolve; });
+    return { ok: 1 };
+  });
+  const discarding = h.send('DISCARD_RECOVERY');
+  await new Promise(resolve => setImmediate(resolve));
+  const recovering = h.send('RECOVER_RECORDING');
+  finish?.();
+  await Promise.all([discarding, recovering]);
+  ok('恢复与丢弃共用互斥操作', !h.sent.some(msg => msg.type === 'OFF_RECOVER_RECORDING') &&
+    !h.local.durableRecording);
 }
 
 {

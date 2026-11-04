@@ -107,11 +107,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     OFF_STOP:    () => { engine.stop();    return { ok: 1 }; },
     OFF_PAUSE:   () => { engine.pause();   return { ok: 1 }; },
     OFF_RESUME:  () => { engine.resume();  return { ok: 1 }; },
-    OFF_DISCARD: () => { engine.discard(); return { ok: 1 }; },
+    OFF_DISCARD: () => engine.discard().then(() => ({ ok: 1 })),
   };
   const fn = h[msg.type];
   if (!fn) return false;
-  reply(fn());
+  const result = fn();
+  if (result instanceof Promise) {
+    result.then(reply).catch(error => reply({ error: error.message }));
+    return true;
+  }
+  reply(result);
   return false;
 });
 
@@ -139,11 +144,17 @@ async function startRecording() {
     saveFile: (blob, filename) => saveFileViaBackground(blob, filename),
   });
 
-  const ok = await engine.start({
-    quality: config.quality,
-    timeLimit: config.timeLimit,
-    outputFormat: config.outputFormat,
-  });
+  let ok = false;
+  try {
+    ok = await engine.start({
+      quality: config.quality,
+      timeLimit: config.timeLimit,
+      outputFormat: config.outputFormat,
+    });
+  } catch (error) {
+    showError(error.message || String(error));
+    notifyBg('RECORDER_STOPPED', { historyEntry: null, captureFailed: true });
+  }
 
   if (ok) {
     startScreen.style.display = 'none';
@@ -279,9 +290,14 @@ function onEvent(name, data) {
       break;
 
     case 'size':
-      sizeInfo.textContent = (data.bytes / 1048576).toFixed(1) + ' MB';
+      sizeInfo.textContent = '已暂存 ' + (data.bytes / 1048576).toFixed(1) + ' MB';
       notifyBg('FILE_SIZE_UPDATE', { size: data.bytes });
       break;
+
+    case 'durable':
+      return notifyCritical('DURABLE_UPDATE', { patch: data });
+    case 'durablecleanup':
+      return notifyCritical('DURABLE_CLEANUP', { id: data && data.id });
 
     case 'processing': {
       const stages = {
@@ -307,7 +323,7 @@ function onEvent(name, data) {
     }
 
     case 'saveerror':
-      stxt.textContent = '保存失败：' + (data && data.message) + '，文件仍在内存';
+      stxt.textContent = '保存失败：' + (data && data.message) + '，文件仍保留';
       saveProgress.textContent = '可重试保存，或明确选择丢弃';
       retrySaveBtn.hidden = false;
       discardSaveBtn.hidden = false;
@@ -350,7 +366,7 @@ async function pollSaveState() {
       const percent = Math.min(100, Math.floor(bg.saveReceived / bg.saveTotal * 100));
       saveProgress.textContent = `${percent}% · ${(bg.saveReceived / 1048576).toFixed(1)} / ${(bg.saveTotal / 1048576).toFixed(1)} MB`;
     } else if (bg.savePhase === 'error' && bg.saveCanRetry) {
-      saveProgress.textContent = '文件仍在内存，可重试或明确丢弃';
+      saveProgress.textContent = '文件仍保留，可重试或明确丢弃';
     }
   } catch (_) {}
 }
@@ -368,6 +384,11 @@ function fmtMs(ms) {
 
 function showError(msg) { errMsg.textContent = '❌ ' + msg; errMsg.classList.remove('hidden'); }
 function notifyBg(type, extra) { try { chrome.runtime.sendMessage({ type, ...extra }).catch(() => {}); } catch (_) {} }
+async function notifyCritical(type, extra) {
+  const result = await chrome.runtime.sendMessage({ type, ...extra });
+  if (!result || result.error) throw new Error((result && result.error) || '元数据未保存');
+  return result;
+}
 
 /** 释放兼容模式额外持有的 getDisplayMedia 音频流（主流由 core 释放） */
 function releaseExtraStreams() {

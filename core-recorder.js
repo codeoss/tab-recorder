@@ -3,7 +3,7 @@
  *
  * 抽出 offscreen.js 和 recorder.js 中一字不差的录制逻辑：
  *   - MediaRecorder 生命周期（start/pause/resume/stop/discard）
- *   - 分片累积 / 定时合并（compact）
+ *   - 分片经有界队列持续写入 OPFS（不保留整段内存副本）
  *   - 定时停止 / 倒计时无关
  *   - onStopped 异步链：fix-webm → 可选 mp4 转码 → 下载 → 上报历史
  *   - elapsed 计时、pickFormat、fmtDur 等纯工具
@@ -24,7 +24,8 @@
  *   engine.isRecording() / .isBusy()   // 录制、保存及失败待处理均为 busy
  *
  * 依赖（调用方 HTML 里要先加载）：
- *   fix-webm.js → fixWebMBlob
+ *   fix-webm.js → fixWebMBlob / fixWebMRecoveryBlob（暂存失败时修复确认前缀）
+ *   durable-recorder.js → createDurableWriter（Worker 同步 OPFS 追加 + flush）
  *   transcoder.js → webmToMp4（webm 转 mp4 时用）/ mp4Faststart（原生 mp4 修 faststart 时用）
  *                  （两者内部都跑在 Web Worker，转码期间主线程不阻塞）
  *   save-file.js → saveFileViaBackground（创建 Blob URL 并等待下载终态）
@@ -41,19 +42,24 @@
    * @param {(blob: Blob, filename: string) => Promise<{filename: string, path: string}>} opts.saveFile
    */
   function createRecorderEngine({ getStream, onEvent, releaseExtra, saveFile }) {
-    const emit = (name, data) => { try { onEvent && onEvent(name, data); } catch (_) {} };
+    const emit = (name, data) => { try { return onEvent && onEvent(name, data); } catch (_) { return undefined; } };
 
     // ── 引擎状态 ─────────────────────────────────────────
     let recorder = null;
     let activeStream = null;     // getStream 返回的主流，core 自行管理释放
-    let chunks = [];
+    let durableWriter = null;
+    const pendingWrites = new Set();
+    let durableError = null;
+    let durableClosed = false;
+    let recordingId = '';
+    let startGeneration = 0;
     let mime = '';
     let recordedIsMp4 = false;   // 录制是否用原生 MP4（决定 onStopped 是否还要转码）
     let startTs = 0;
+    let stopDurationMs = null;
     let pausedMs = 0;
     let pauseTs = 0;
     let stopTimer = null;
-    let flushTimer = null;
     let tickInterval = null;
     let paused_ = false;        // 是否处于暂停态（内部状态，外部用 isPaused() 查询）
     let isProcessing = false;   // onStopped 异步链进行中：关窗会丢视频
@@ -69,41 +75,83 @@
       // 重入守卫：上一段还在录制/保存时拒绝。旧 engine 的 MediaRecorder 与
       // 媒体轨一旦失去引用就再无法停止，会变成幽灵录制
       if (isRecording() || isProcessing) return false;
+      const generation = ++startGeneration;
       opts = opts || {};
       limitMs = (opts.timeLimit || 0) * 1000;
       outputFormat = opts.outputFormat || 'webm';
       isProcessing = false;
       discarded = false;
+      durableError = null;
+      durableClosed = false;
+      stopDurationMs = null;
       pendingSave = null;
       saveInFlight = false;
 
       const recStream = await getStream(opts);
       if (!recStream) return false;   // 取流失败，调用方已在 onEvent('error') 上报
+      if (generation !== startGeneration) {
+        recStream.getTracks().forEach(track => track.stop());
+        return false;
+      }
       activeStream = recStream;
 
       const fmt = pickFormat(outputFormat);
       mime = fmt.mime;
       recordedIsMp4 = fmt.isMp4;
-      chunks = [];
-      recorder = new MediaRecorder(recStream, {
-        mimeType: mime,
-        videoBitsPerSecond: parseInt(opts.quality) || 8000000,
-      });
-
-      recorder.ondataavailable = e => {
-        if (e.data && e.data.size > 0) { chunks.push(e.data); reportSize(); }
-      };
-      recorder.onstop = () => onStopped();
-
-      // Chrome「停止共享」条 / 流被外部结束 → 干净收尾
-      // 监听所有轨道：兼容模式下音频轨 ended 也要捕获（否则录制继续但无声）
-      recStream.getTracks().forEach(t => {
-        t.addEventListener('ended', () => {
-          if (recorder && recorder.state !== 'inactive') stop();
+      recordingId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const startedAt = Date.now();
+      try {
+        durableWriter = await createDurableWriter({
+          id: recordingId, mime,
+          onMetadata: async patch => {
+            if (durableClosed) return;
+            await emit('durable', { ...patch, outputFormat, recordedIsMp4, startedAt });
+            if (Number.isFinite(patch.bytes)) emit('size', { bytes: patch.bytes });
+          },
         });
-      });
+      } catch (error) {
+        releaseAll();
+        throw error;
+      }
+      if (generation !== startGeneration) {
+        await cleanupDurable();
+        releaseAll();
+        return false;
+      }
+      try {
+        recorder = new MediaRecorder(recStream, {
+          mimeType: mime,
+          videoBitsPerSecond: parseInt(opts.quality) || 8000000,
+        });
 
-      recorder.start(1000);
+        recorder.ondataavailable = e => {
+          if (!e.data || !e.data.size || !durableWriter) return;
+          const write = durableWriter.append(e.data, elapsed());
+          pendingWrites.add(write);
+          write.then(() => pendingWrites.delete(write)).catch(error => {
+            pendingWrites.delete(write);
+            if (durableError || discarded) return;
+            durableError = error;
+            emit('saveerror', { message: `暂存失败：${error.message}`, canRetry: true });
+            if (recorder && recorder.state !== 'inactive') stop();
+          });
+        };
+        recorder.onstop = () => onStopped();
+
+        // Chrome「停止共享」条 / 流被外部结束 → 干净收尾
+        // 监听所有轨道：兼容模式下音频轨 ended 也要捕获（否则录制继续但无声）
+        recStream.getTracks().forEach(t => {
+          t.addEventListener('ended', () => {
+            if (recorder && recorder.state !== 'inactive') stop();
+          });
+        });
+
+        recorder.start(1000);
+      } catch (error) {
+        await cleanupDurable();
+        releaseAll();
+        throw error;
+      }
       startTs = Date.now();
       pausedMs = 0;
       paused_ = false;
@@ -111,18 +159,18 @@
       emit('started', { timeLimit: opts.timeLimit || 0 });
       startTick();
       if (limitMs > 0) stopTimer = setTimeout(() => stop(), limitMs);
-      flushTimer = setInterval(compact, 60000);
       return true;
     }
 
     /* ── 停止 / 暂停 / 恢复 / 丢弃 ──────────────────── */
 
     function stop() {
+      startGeneration++;
       // 暂停态直接停止：先把这段暂停并入 pausedMs，否则 elapsed() 会把
       // 暂停时长算进结果，fixWebM 补出的 Duration 比真实内容长
       if (paused_ && pauseTs) { pausedMs += Date.now() - pauseTs; paused_ = false; }
+      stopDurationMs = elapsed();
       if (stopTimer)  { clearTimeout(stopTimer);  stopTimer = null; }
-      if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
       if (recorder && recorder.state !== 'inactive') {
         if (!isProcessing) {
           isProcessing = true;
@@ -151,27 +199,33 @@
       emit('resumed');
     }
 
-    function discard() {
+    async function cleanupDurable() {
+      durableClosed = true;
+      const writer = durableWriter;
+      if (writer) {
+        await writer.discard();
+        if (durableWriter === writer) durableWriter = null;
+      }
+      await emit('durablecleanup', { id: recordingId });
+    }
+
+    async function discard() {
+      startGeneration++;
       // 标记丢弃：若 onStopped 异步链（fixWebM/转码）正在进行，
       // 让它跑完后静默收尾——不下载、不写历史
       discarded = true;
-      chunks = [];
+      isProcessing = true;
       if (stopTimer)  { clearTimeout(stopTimer);  stopTimer = null; }
-      if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
-      if (pendingSave && !saveInFlight) {
-        pendingSave = null;
-        isProcessing = false;
-        releaseAll();
-        emit('processing', { active: false });
-        emit('stopped', { historyEntry: null, discarded: true });
-        return;
-      }
       if (recorder && recorder.state !== 'inactive') {
         recorder.ondataavailable = null;
         recorder.onstop = null;
         try { recorder.stop(); } catch (_) {}
       }
       releaseAll();
+      await cleanupDurable();
+      if (!saveInFlight) pendingSave = null;
+      isProcessing = false;
+      emit('processing', { active: false });
       emit('stopped', { historyEntry: null, discarded: true });
     }
 
@@ -186,6 +240,7 @@
         const result = await saveFile(job.blob, job.filename);
         if (discarded) {
           pendingSave = null;
+          await cleanupDurable();
           isProcessing = false;
           saveInFlight = false;
           emit('processing', { active: false });
@@ -196,8 +251,10 @@
           filename, size: job.blob.size,
           duration: fmtDur(job.durMs), date: new Date().toLocaleString('zh-CN'),
           format: job.blob.type.includes('mp4') ? 'mp4' : 'webm',
+          recordingId,
         };
         pendingSave = null;
+        await cleanupDurable();
         emit('stopped', { historyEntry });
         emit('saved', { filename });
         isProcessing = false;
@@ -208,6 +265,7 @@
         saveInFlight = false;
         if (discarded) {
           pendingSave = null;
+          await cleanupDurable();
           isProcessing = false;
           emit('processing', { active: false });
           return true;
@@ -226,16 +284,24 @@
       releaseAll(); stopTick();
       isProcessing = true;
 
-      if (!chunks.length) {
+      try { await Promise.all([...pendingWrites]); } catch (_) {}
+      let blob = null;
+      try {
+        if (durableWriter) blob = await durableWriter.finalize();
+      } catch (error) {
+        isProcessing = false;
+        emit('saveerror', { message: `无法完成暂存：${error.message}`, canRetry: true });
+        return;
+      }
+      if (!blob || !blob.size) {
+        await cleanupDurable();
         isProcessing = false;
         emit('processing', { active: false });
         emit('stopped', { historyEntry: null });
         return;
       }
 
-      const durMs = elapsed();
-      let blob = new Blob(chunks, { type: mime });
-      chunks = [];
+      const durMs = stopDurationMs !== null ? stopDurationMs : elapsed();
       emit('processing', { active: true, stage: recordedIsMp4 ? 'mp4-fix' : 'webm-fix' });
 
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -244,6 +310,14 @@
 
       if (recordedIsMp4) {
         // 原生 MP4：faststart / fMP4 时长修补；非常规布局才回退 wasm。
+        if (durableError) {
+          try { blob = await recoverMp4Blob(blob, durableWriter.bytes); }
+          catch (error) {
+            isProcessing = false;
+            emit('saveerror', { message: `MP4 暂存恢复失败：${error.message}`, canRetry: true });
+            return;
+          }
+        }
         try {
           finalBlob = await mp4FaststartJs(blob);
         } catch (e1) {
@@ -256,7 +330,11 @@
         }
       } else {
         // WebM：补 SeekHead/Cues/Duration，使 Chrome 与 WMP 均可拖动
-        try { blob = await fixWebMBlob(blob, durMs); } catch (e) { console.warn(e); }
+        try {
+          blob = durableError
+            ? await fixWebMRecoveryBlob(blob, durMs, durableWriter.bytes)
+            : await fixWebMBlob(blob, durMs);
+        } catch (e) { console.warn(e); }
         finalBlob = blob;
 
         if (outputFormat === 'mp4') {
@@ -271,6 +349,7 @@
       }
 
       if (discarded) {
+        await cleanupDurable();
         isProcessing = false;
         emit('processing', { active: false });
         return;
@@ -320,13 +399,6 @@
         if (MediaRecorder.isTypeSupported(t)) return { mime: t, isMp4: false };
       return { mime: 'video/webm', isMp4: false };
     }
-
-    function reportSize() {
-      const s = chunks.reduce((a, c) => a + c.size, 0);
-      emit('size', { bytes: s });
-    }
-
-    function compact() { if (chunks.length > 120) chunks = [new Blob(chunks, { type: mime })]; }
 
     function fmtDur(ms) {
       const s = Math.max(0, Math.floor(ms / 1000));

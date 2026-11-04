@@ -25,6 +25,9 @@ pnpm-lock.yaml
 e2e/.chrome-profile/
 e2e/.ext-build/
 e2e/downloads/
+e2e/.recovery-profile/
+e2e/.recovery-ext-build/
+e2e/recovery-downloads/
 
 # ===== 录制输出（开发/测试时可能落地的音视频文件）=====
 *.webm
