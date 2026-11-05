@@ -133,7 +133,7 @@ async function state(popup) {
   return await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_STATE' }));
 }
 
-for (const format of ['webm', 'mp4']) {
+for (const format of process.env.E2E_RECOVERY_SCENARIOS ? [] : ['webm', 'mp4']) {
   console.log(`\n恢复场景：${format.toUpperCase()} 强杀 → 重启 → 恢复`);
   for (const target of [PROFILE, DOWNLOADS]) fs.rmSync(target, { recursive: true, force: true });
   fs.mkdirSync(DOWNLOADS, { recursive: true });
@@ -196,7 +196,9 @@ for (const format of ['webm', 'mp4']) {
   await ctx.close();
 }
 
-for (const scenario of ['offscreen', 'reload', 'discard', 'download-intent']) {
+const scenarios = process.env.E2E_RECOVERY_SCENARIOS
+  ? process.env.E2E_RECOVERY_SCENARIOS.split(',') : ['offscreen', 'reload', 'discard', 'download-intent'];
+for (const scenario of scenarios) {
   console.log(`\n恢复场景：${scenario}`);
   for (const target of [PROFILE, DOWNLOADS]) fs.rmSync(target, { recursive: true, force: true });
   fs.mkdirSync(DOWNLOADS, { recursive: true });
@@ -245,13 +247,14 @@ for (const scenario of ['offscreen', 'reload', 'discard', 'download-intent']) {
     }
     await reload.click({ timeout: 15000 });
     const enabled = card.locator('#enableToggle');
-    if (await enabled.evaluate(el => el.disabled)) {
+    const unavailable = await enabled.evaluate(el => el.disabled ||
+      el.getAttribute('aria-disabled') === 'true' || el.getAttribute('aria-checked') === 'false');
+    if (unavailable) {
       console.log('  ⚠️ SKIP：CfT 管理策略在 reload 后禁用侧载扩展，无法完成真实 reload 恢复测试');
       await extensions.close();
       await ctx.close();
       continue;
     }
-    if (await enabled.getAttribute('aria-checked') === 'false') await enabled.evaluate(el => el.click());
     await extensions.close();
   } else {
     await sw.evaluate(() => chrome.offscreen.closeDocument());
@@ -287,7 +290,8 @@ for (const scenario of ['offscreen', 'reload', 'discard', 'download-intent']) {
   } else {
     const recovered = await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'RECOVER_RECORDING' }));
     const files = fs.readdirSync(DOWNLOADS).filter(name => !name.endsWith('.crdownload'));
-    ok(`${scenario} 后恢复下载成功`, recovered?.ok === 1 && files.length === 1);
+    ok(`${scenario} 后恢复下载成功`, recovered?.ok === 1 && files.length === 1,
+      JSON.stringify({ recovered, files }));
     if (files.length === 1) {
       const decode = spawnSync('ffmpeg', ['-v', 'warning', '-i', path.join(DOWNLOADS, files[0]), '-f', 'null', '-'], { encoding: 'utf8' });
       ok(`${scenario} 恢复文件完整解码`, decode.status === 0 && !decode.stderr.includes('File ended prematurely'), decode.stderr.trim());
