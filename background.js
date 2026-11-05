@@ -38,6 +38,9 @@ const state = {
   saveReceived: 0,
   saveTotal: 0,
   saveGeneration: 0,        // 新录制/重试递增，防止旧异步结果提交到新任务
+  recoveryAvailable: false,
+  recoveryBusy: false,
+  durableBytes: 0,
 };
 
 /* ═══════════════════════════════════════════════════════
@@ -75,8 +78,37 @@ function restoreState() {
   }).catch(() => {});
 }
 
-// 顶层立即发起恢复；route() 会 await 它
+// 顶层立即发起恢复；route() 会 await 它们
 const stateReady = restoreState();
+const recoveryReady = (async () => {
+  await stateReady;
+  try {
+    const stored = await chrome.storage.local.get('durableRecording');
+    const durable = stored.durableRecording;
+    if (!durable) return;
+    const resuming = state.recoveryBusy;
+    const owned = resuming ? false : await hasLiveEngineOwner();
+    setState({ recoveryAvailable: !owned, durableBytes: durable.bytes || 0 });
+    if (resuming) {
+      Promise.resolve().then(() => recoverExistingRecording()).catch(() => {});
+    }
+  } catch (_) {}
+})();
+
+async function hasLiveEngineOwner() {
+  try {
+    if (state.mode === 'tab') {
+      if (!chrome.runtime.getContexts) return false;
+      const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+      return contexts.length > 0;
+    }
+    if (state.mode === 'desktop' && state.recorderWindowId) {
+      await chrome.windows.get(state.recorderWindowId);
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
 
 function downloadBasename(path) {
   return (path || '').replace(/\\/g, '/').split('/').pop() || '';
@@ -185,13 +217,171 @@ async function openSaveWindow() {
   }
 }
 
+let recoveryInFlight = null;
+
+function recoveryHistory(meta, filename, size) {
+  const seconds = Math.max(0, Math.floor((meta.mediaTimeMs || 0) / 1000));
+  return {
+    filename,
+    size: size || meta.bytes || 0,
+    duration: [Math.floor(seconds / 3600), Math.floor((seconds % 3600) / 60), seconds % 60]
+      .map(value => String(value).padStart(2, '0')).join(':'),
+    date: new Date().toLocaleString('zh-CN'),
+    format: meta.recordedIsMp4 || meta.outputFormat === 'mp4' ? 'mp4' : 'webm',
+    recordingId: meta.id,
+  };
+}
+
+async function finishRecovery(meta, entry) {
+  const historyEntry = entry || recoveryHistory(meta, state.saveFilename, state.saveTotal);
+  await saveHistory(historyEntry);
+  await chrome.storage.local.remove('durableRecording');
+  setState({
+    status: 'idle', processing: false, savePhase: 'complete', processingStage: '',
+    saveFilename: historyEntry.filename, saveCanRetry: false,
+    recoveryAvailable: false, recoveryBusy: false, durableBytes: 0,
+  });
+  badge('idle');
+  return { ok: 1 };
+}
+
+async function discardRecoveryFile(meta) {
+  await ensureOffscreen();
+  const result = await chrome.runtime.sendMessage({
+    type: 'OFF_DISCARD_RECOVERY', target: 'offscreen', metadata: meta,
+  });
+  if (!result || result.error) throw new Error((result && result.error) || '无法删除恢复文件');
+}
+
+function recoverExistingRecording() {
+  if (recoveryInFlight) return recoveryInFlight;
+  recoveryInFlight = (async () => {
+    const stored = await chrome.storage.local.get('durableRecording');
+    let meta = stored.durableRecording;
+    if (!meta) return { error: '没有可恢复的录制' };
+    setState({ recoveryAvailable: true, recoveryBusy: true, durableBytes: meta.bytes || 0 });
+
+    if (!meta.downloadId && meta.downloadIntent) {
+      const intent = meta.downloadIntent;
+      const dot = intent.filename.lastIndexOf('.');
+      const stem = dot >= 0 ? intent.filename.slice(0, dot) : intent.filename;
+      const extension = dot >= 0 ? intent.filename.slice(dot) : '';
+      const candidates = await chrome.downloads.search({
+        startedAfter: new Date(Math.max(0, intent.startedAt - 1000)).toISOString(),
+      });
+      candidates.sort((a, b) => Date.parse(b.startTime || 0) - Date.parse(a.startTime || 0));
+      const item = candidates.find(candidate => {
+        if (intent.url) return (candidate.finalUrl || candidate.url) === intent.url;
+        const name = downloadBasename(candidate.filename);
+        return name === intent.filename ||
+          (name.startsWith(stem + ' (') && name.endsWith(')' + extension));
+      });
+      meta = { ...meta, downloadIntent: null };
+      if (item) {
+        meta.downloadId = item.id;
+        meta.phase = 'downloading';
+      }
+      await chrome.storage.local.set({ durableRecording: meta });
+    }
+
+    if (meta.downloadId) {
+      const [item] = await chrome.downloads.search({ id: meta.downloadId });
+      if (item && item.state === 'complete') {
+        const filename = downloadBasename(item.filename) || state.saveFilename;
+        await discardRecoveryFile(meta);
+        return await finishRecovery(meta, recoveryHistory(meta, filename, item.totalBytes));
+      }
+      if (item && item.state === 'in_progress') {
+        setState({
+          processing: true, savePhase: 'downloading', processingStage: 'download',
+          downloadId: meta.downloadId, saveFilename: downloadBasename(item.filename),
+          saveCanRetry: true,
+        });
+        await openSaveWindow();
+        for (;;) {
+          const status = await refreshDownloadStatus(meta.downloadId);
+          if (status.state === 'complete') {
+            await discardRecoveryFile(meta);
+            return await finishRecovery(meta, recoveryHistory(meta, status.filename, status.total));
+          }
+          if (status.state === 'interrupted' || status.error) break;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+      meta = { ...meta, downloadId: 0, phase: 'error' };
+      await chrome.storage.local.set({ durableRecording: meta });
+    }
+
+    setState({
+      status: 'idle', processing: true, savePhase: 'processing',
+      processingStage: meta.recordedIsMp4 ? 'mp4-fix' : 'webm-fix',
+      downloadId: 0, saveError: '', saveReceived: 0, saveTotal: 0,
+      saveCanRetry: true, recoveryAvailable: true, recoveryBusy: true,
+      saveGeneration: state.saveGeneration + 1,
+    });
+    badge('saving');
+    await openSaveWindow();
+    await ensureOffscreen();
+    const result = await chrome.runtime.sendMessage({
+      type: 'OFF_RECOVER_RECORDING', target: 'offscreen', metadata: meta,
+    });
+    if (!result || result.error) throw new Error((result && result.error) || '恢复请求未送达');
+    return await finishRecovery(meta, result.historyEntry);
+  })().catch(error => {
+    setState({
+      status: 'idle', processing: true, savePhase: 'error', processingStage: '',
+      saveError: error.message || String(error), saveCanRetry: true,
+      recoveryAvailable: true, recoveryBusy: false,
+    });
+    badge('error');
+    return { error: error.message || String(error) };
+  }).finally(() => { recoveryInFlight = null; });
+  return recoveryInFlight;
+}
+
+function discardRecovery() {
+  if (recoveryInFlight) return Promise.resolve({ error: '正在处理录制，请稍候' });
+  recoveryInFlight = (async () => {
+    const stored = await chrome.storage.local.get('durableRecording');
+    const meta = stored.durableRecording;
+    if (!meta) return { ok: 1 };
+    if (meta.downloadId) {
+      const [item] = await chrome.downloads.search({ id: meta.downloadId });
+      if (item && item.state === 'in_progress') {
+        try { await chrome.downloads.cancel(meta.downloadId); } catch (_) {}
+      }
+    }
+    await discardRecoveryFile(meta);
+    await chrome.storage.local.remove('durableRecording');
+    resetSaveResult();
+    setState({ recoveryAvailable: false, recoveryBusy: false, durableBytes: 0, processing: false });
+    badge('idle');
+    return { ok: 1 };
+  })().finally(() => { recoveryInFlight = null; });
+  return recoveryInFlight;
+}
+
 async function reconcileEngineContext() {
-  if (!state.processing || state.mode !== 'tab') return;
-  if (!chrome.runtime.getContexts) return;
+  const active = state.processing || ['countdown', 'recording', 'paused'].includes(state.status);
+  if (!active || state.mode !== 'tab' || !chrome.runtime.getContexts) return;
   const generation = state.saveGeneration;
   const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-  if (generation !== state.saveGeneration) return;
-  if (!contexts.length) markSaveContextLost('录制上下文已关闭，无法继续保存');
+  if (generation !== state.saveGeneration || contexts.length) return;
+  const stored = await chrome.storage.local.get('durableRecording');
+  if (stored.durableRecording) {
+    setState({
+      status: 'idle', processing: false, savePhase: 'error',
+      saveError: '录制上下文已关闭，可从磁盘暂存恢复', saveCanRetry: true,
+      recoveryAvailable: true, recoveryBusy: false,
+      durableBytes: stored.durableRecording.bytes || 0,
+    });
+    badge('error');
+  } else if (state.processing) {
+    markSaveContextLost('录制上下文已关闭，无法继续保存');
+  } else {
+    setState({ status: 'idle' });
+    badge('idle');
+  }
 }
 
 chrome.windows.onRemoved.addListener(async windowId => {
@@ -202,7 +392,16 @@ chrome.windows.onRemoved.addListener(async windowId => {
   }
   if (windowId && windowId === state.recorderWindowId && state.recorderWindowId !== 0) {
     setState({ recorderWindowId: 0, recorderTabId: 0 });
-    if (state.processing) {
+    const stored = await chrome.storage.local.get('durableRecording');
+    if (stored.durableRecording) {
+      setState({
+        status: 'idle', processing: false, savePhase: 'error',
+        saveError: '录制窗口已关闭，可从磁盘暂存恢复', saveCanRetry: true,
+        recoveryAvailable: true, recoveryBusy: false,
+        durableBytes: stored.durableRecording.bytes || 0,
+      });
+      badge('error');
+    } else if (state.processing) {
       markSaveContextLost('录制窗口已关闭，无法继续保存');
     } else if (state.status !== 'idle') {
       setState({ status: 'idle' });
@@ -222,6 +421,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
 
 async function route(msg, sender = {}) {
   await stateReady;   // 确保 SW 回收后已恢复 state
+  await recoveryReady;
   switch (msg.type) {
 
     /* ── 开始录制（来自 popup）────────────────────────── */
@@ -230,6 +430,10 @@ async function route(msg, sender = {}) {
       // 仍在录制（幽灵录制），且旧链的 RECORDING_STOPPED 会把新状态掐掉
       if (state.status !== 'idle' || state.processing) {
         return { error: '已有录制进行中或仍在保存，请先停止' };
+      }
+      const durable = await chrome.storage.local.get('durableRecording');
+      if (durable.durableRecording) {
+        return { error: '发现未完成的录制，请先恢复保存或明确丢弃' };
       }
       resetSaveResult();
       setState({ saveGeneration: state.saveGeneration + 1 });
@@ -326,11 +530,28 @@ async function route(msg, sender = {}) {
     }
 
     case 'OPEN_SAVE_WINDOW': {
-      if (state.mode !== 'tab') return { error: '当前录制使用桌面保存窗口' };
+      if (state.mode !== 'tab' && !state.recoveryAvailable) return { error: '当前录制使用桌面保存窗口' };
       return { ok: 1, windowId: await openSaveWindow() };
     }
 
+    case 'RECOVER_RECORDING':
+      return await recoverExistingRecording();
+
+    case 'RECOVERY_COMPLETE': {
+      const entry = msg.historyEntry;
+      if (!entry || !entry.recordingId) return { error: '恢复完成记录无效' };
+      const stored = await chrome.storage.local.get('durableRecording');
+      const meta = stored.durableRecording;
+      if (!meta) return { ok: 1 };
+      if (meta.id !== entry.recordingId) return { error: '恢复完成记录已过期' };
+      return await finishRecovery(meta, entry);
+    }
+
+    case 'DISCARD_RECOVERY':
+      return await discardRecovery();
+
     case 'RETRY_SAVE': {
+      if (state.recoveryAvailable) return await recoverExistingRecording();
       if (state.savePhase !== 'error' || !state.saveCanRetry) {
         return { error: '当前没有可重试的保存任务' };
       }
@@ -362,6 +583,14 @@ async function route(msg, sender = {}) {
         return { error: '保存参数无效' };
       }
       const generation = state.saveGeneration;
+      const durable = await chrome.storage.local.get('durableRecording');
+      const durableBefore = durable.durableRecording;
+      if (durableBefore) {
+        await chrome.storage.local.set({ durableRecording: {
+          ...durableBefore, phase: 'processing', downloadId: 0,
+          downloadIntent: { filename: msg.filename, url: msg.url, startedAt: Date.now(), generation },
+        } });
+      }
       const downloadId = await chrome.downloads.download({
         url: msg.url,
         filename: msg.filename,
@@ -376,6 +605,11 @@ async function route(msg, sender = {}) {
         saveError: '', saveFilename: msg.filename, saveCanRetry: true,
         saveReceived: 0, saveTotal: 0,
       });
+      if (durableBefore) {
+        await chrome.storage.local.set({ durableRecording: {
+          ...durableBefore, phase: 'downloading', downloadId, downloadIntent: null,
+        } });
+      }
       return { downloadId };
     }
 
@@ -406,12 +640,14 @@ async function route(msg, sender = {}) {
         badge('preparing');
         return { ok: 1 };
       }
-      setState({ status: 'idle', fileSize: 0, recorderWindowId: 0, recorderTabId: 0, processing: false });
+      await chrome.storage.local.remove('durableRecording');
+      setState({ status: 'idle', fileSize: 0, recorderWindowId: 0, recorderTabId: 0,
+        processing: false, recoveryAvailable: false, recoveryBusy: false, durableBytes: 0 });
       if (msg.discarded) {
         resetSaveResult();
       } else if (msg.historyEntry) {
         setState({ savePhase: 'complete', saveCanRetry: false });
-        saveHistory(msg.historyEntry);
+        await saveHistory(msg.historyEntry);
       }
       badge('idle');
       return { ok: 1 };
@@ -488,6 +724,29 @@ async function route(msg, sender = {}) {
     case 'COUNTDOWN_TICK':
       setState({ countdownRemaining: msg.remaining || 0 });
       return { ok: 1 };
+
+    case 'DURABLE_CLEANUP': {
+      const stored = await chrome.storage.local.get('durableRecording');
+      if (stored.durableRecording && stored.durableRecording.id === msg.id) {
+        await chrome.storage.local.remove('durableRecording');
+      }
+      return { ok: 1 };
+    }
+
+    case 'DURABLE_UPDATE': {
+      const patch = msg.patch;
+      if (!patch || typeof patch.id !== 'string' || !patch.id) return { error: '暂存元数据无效' };
+      const stored = await chrome.storage.local.get('durableRecording');
+      const previous = stored.durableRecording;
+      if (previous && previous.id !== patch.id) {
+        return { error: '存在另一段未完成的录制，请先恢复或丢弃' };
+      }
+      await chrome.storage.local.set({
+        durableRecording: { ...(previous || {}), ...patch },
+      });
+      if (Number.isFinite(patch.bytes)) setState({ durableBytes: patch.bytes });
+      return { ok: 1 };
+    }
 
     default:
       return null;
@@ -659,13 +918,13 @@ function badge(mode) {
   chrome.action.setBadgeBackgroundColor({ color: b.color });
 }
 
-function saveHistory(entry) {
-  chrome.storage.local.get('recordingHistory', d => {
-    const h = d.recordingHistory || [];
-    h.unshift(entry);
-    if (h.length > 30) h.length = 30;
-    chrome.storage.local.set({ recordingHistory: h });
-  });
+async function saveHistory(entry) {
+  const data = await chrome.storage.local.get('recordingHistory');
+  const h = data.recordingHistory || [];
+  if (entry.recordingId && h.some(item => item.recordingId === entry.recordingId)) return;
+  h.unshift(entry);
+  if (h.length > 30) h.length = 30;
+  await chrome.storage.local.set({ recordingHistory: h });
 }
 
 /* ── 安装时写入默认设置 ────────────────────────────────── */

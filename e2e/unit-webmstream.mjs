@@ -30,7 +30,7 @@ import { checkWebMSeekStructure, checkWebMKeyframeCues, webMClustersEqual } from
 
 globalThis.self = globalThis;   // fix-webm.js 是经典脚本（IIFE on self）
 await import(pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fix-webm.js')).href);
-const { fixWebMBlob, _fixWebMFullBuffer, _fixWebMStream } = globalThis;
+const { fixWebMBlob, fixWebMRecoveryBlob, _fixWebMFullBuffer, _fixWebMStream } = globalThis;
 
 let failed = 0;
 function ok(name, cond, extra = '') {
@@ -524,6 +524,72 @@ await expectOriginal('截断的 ReferenceBlock', wrapDefinite([
 await expectOriginal('Info 缺少 TimecodeScale', wrapDefinite([
   el(INFO, el(DURATION, new Uint8Array(8))), tracks, cluster(0),
 ]));
+
+/* 23. 异常恢复：完整但未关闭的末尾 Cluster 等宽收尾 */
+function closeUnknownCluster(bytes, clusterOff) {
+  const dataOff = clusterOff + CLUSTER.length + 8;
+  const size = new Uint8Array(8);
+  new DataView(size.buffer).setBigUint64(0, BigInt(bytes.length - dataOff));
+  size[0] |= 1;
+  return cat(bytes.subarray(0, clusterOff + CLUSTER.length), size, bytes.subarray(dataOff));
+}
+
+async function recoveryGolden(name, bytes, normalized, confirmedBytes = bytes.length) {
+  const actual = Buffer.from(await (await fixWebMRecoveryBlob(
+    new Blob([bytes]), 1500, confirmedBytes)).arrayBuffer());
+  const expected = Buffer.from(await (await _fixWebMStream(new Blob([normalized]), 1500, 64)).arrayBuffer());
+  let diff = -1;
+  for (let i = 0; i < Math.min(actual.length, expected.length); i++) {
+    if (actual[i] !== expected[i]) { diff = i; break; }
+  }
+  ok(name, actual.equals(expected), `len=${actual.length}/${expected.length} diff=${diff}`);
+  const report = checkWebMSeekStructure(actual);
+  ok(`${name}：Cue 定位正确`, report.errors.length === 0, report.errors.join('；'));
+}
+
+{
+  const lastOff = wrapUnknown([info({}), tracks, cluster(0)]).length;
+  const bytes = wrapUnknown([
+    info({}), tracks, cluster(0),
+    cat(elUnknown(CLUSTER), cat(
+      el(TIMECODE, uintBytes(1000)), simpleBlock({ keyframe: true, payload: new Uint8Array(20) }),
+    )),
+  ]);
+  await recoveryGolden('完整 unknown-size 末尾 Cluster 等宽收尾', bytes, closeUnknownCluster(bytes, lastOff));
+}
+
+/* 24. 异常恢复：截断 SimpleBlock 只去掉不完整子元素 */
+{
+  const prefix = wrapUnknown([info({}), tracks, cluster(0)]);
+  const head = elUnknown(CLUSTER);
+  const time = el(TIMECODE, uintBytes(1000));
+  const block = simpleBlock({ keyframe: true, payload: new Uint8Array(20) });
+  const bytes = cat(prefix, head, time, block.subarray(0, block.length - 5));
+  const completePrefix = cat(prefix, head, time);
+  await recoveryGolden('截断 SimpleBlock 保留完整 Cluster 前缀',
+    bytes, closeUnknownCluster(completePrefix, prefix.length));
+}
+
+/* 25. 异常恢复：BlockGroup 截断不丢掉同 Cluster 已完整关键帧 */
+{
+  const prefix = wrapUnknown([info({}), tracks, cluster(0)]);
+  const head = elUnknown(CLUSTER);
+  const completeContent = cat(
+    el(TIMECODE, uintBytes(1000)), simpleBlock({ keyframe: true, relative: 20 }),
+  );
+  const partialGroup = blockGroup({ relative: 40, payload: new Uint8Array(20) });
+  const bytes = cat(prefix, head, completeContent, partialGroup.subarray(0, partialGroup.length - 5));
+  const completePrefix = cat(prefix, head, completeContent);
+  await recoveryGolden('截断 BlockGroup 保留前序完整关键帧',
+    bytes, closeUnknownCluster(completePrefix, prefix.length));
+}
+
+/* 26. confirmedBytes 是硬上限，残缺 Cluster 头不能进入产物 */
+{
+  const prefix = wrapUnknown([info({}), tracks, cluster(0)]);
+  const bytes = cat(prefix, new Uint8Array([0x1F, 0x43, 0xB6]));
+  await recoveryGolden('残缺 Cluster 头按确认边界截断', bytes, prefix);
+}
 
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n全部通过 🎉');
 process.exit(failed ? 1 : 0);

@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 globalThis.self = globalThis;
 let fixCalls = 0;
 globalThis.fixWebMBlob = async blob => { fixCalls++; return blob; };
+globalThis.fixWebMRecoveryBlob = async blob => { fixCalls++; return blob; };
 globalThis.mp4FaststartJs = async blob => blob;
 globalThis.mp4Faststart = async blob => blob;
 globalThis.webmToMp4 = async blob => blob;
@@ -15,9 +16,44 @@ globalThis.document = {
   createElement: () => ({ click() {} }),
 };
 
+const durableWriters = [];
+globalThis.createDurableWriter = async ({ id, mime, onMetadata }) => {
+  const parts = [];
+  let failed = null;
+  let finalized = null;
+  const writer = {
+    bytes: 0,
+    discarded: false,
+    async append(blob, mediaTimeMs) {
+      if (failed) throw failed;
+      if (writer.failWith) { failed = writer.failWith; throw failed; }
+      if (writer.appendHold) await writer.appendHold;
+      parts.push(blob);
+      writer.bytes += blob.size;
+      await onMetadata({ id, mime, bytes: writer.bytes, mediaTimeMs, phase: 'recording' });
+    },
+    async finalize() {
+      if (finalized) return finalized;
+      if (writer.finalizeError) throw writer.finalizeError;
+      if (writer.finalizeHold) await writer.finalizeHold;
+      finalized = new File(parts, `tab-record-${id}.media`, { type: mime });
+      await onMetadata({ id, mime, bytes: writer.bytes, phase: 'processing' });
+      return finalized;
+    },
+    async discard() {
+      if (writer.appendHold) await writer.appendHold;
+      if (writer.discardError) throw writer.discardError;
+      writer.discarded = true; parts.length = 0;
+    },
+  };
+  durableWriters.push(writer);
+  return writer;
+};
+
+let lastRecorder;
 class FakeMediaRecorder {
   static isTypeSupported(type) { return type.startsWith('video/webm'); }
-  constructor() { this.state = 'inactive'; }
+  constructor() { this.state = 'inactive'; lastRecorder = this; }
   start() { this.state = 'recording'; }
   pause() { this.state = 'paused'; }
   resume() { this.state = 'recording'; }
@@ -127,13 +163,182 @@ function successEvents(events) {
   engine.stop();
   await waitFor(() => calls.length === 1 || events.some(x =>
     x.name === 'saved' || x.name === 'stopped' || x.name === 'saveerror'));
-  engine.discard();
+  await engine.discard();
   const stopped = events.find(x => x.name === 'stopped' && x.data?.discarded === true);
   ok('失败后明确丢弃释放忙态', !!stopped && !engine.isBusy());
   ok('丢弃不写成功历史且不再下载', !events.some(x => x.name === 'saved') && calls.length === 1);
   if (typeof engine.retrySave === 'function') {
     ok('丢弃后不能重试', (await engine.retrySave()) === false && calls.length === 1);
   }
+}
+
+{
+  const calls = [];
+  const { engine } = engineWith(async blob => {
+    calls.push(blob);
+    return { filename: 'durable.webm', path: 'C:/Downloads/durable.webm' };
+  });
+  const before = durableWriters.length;
+  await engine.start({ outputFormat: 'webm' });
+  const writer = durableWriters[before];
+  lastRecorder.ondataavailable({ data: new Blob(['first']) });
+  await waitFor(() => writer.bytes === 5);
+  engine.stop();
+  await waitFor(() => !engine.isBusy());
+  ok('正常停止保存 writer 的完整 File',
+    calls[0] instanceof File && await calls[0].text() === 'firstencoded');
+}
+
+{
+  const { engine } = engineWith(async () => ({ filename: 'unused.webm' }));
+  const before = durableWriters.length;
+  await engine.start({ outputFormat: 'webm' });
+  const writer = durableWriters[before];
+  await engine.discard();
+  ok('录制中明确丢弃会删除暂存', writer.discarded && !engine.isBusy());
+}
+
+{
+  const calls = [];
+  const { engine, events } = engineWith(async blob => {
+    calls.push(blob);
+    return { filename: 'confirmed-prefix.webm', path: 'C:/Downloads/confirmed-prefix.webm' };
+  });
+  const before = durableWriters.length;
+  await engine.start({ outputFormat: 'webm' });
+  const writer = durableWriters[before];
+  lastRecorder.ondataavailable({ data: new Blob(['first']) });
+  await waitFor(() => writer.bytes === 5);
+  writer.failWith = new Error('OPFS_FULL');
+  lastRecorder.ondataavailable({ data: new Blob(['unconfirmed']) });
+  await waitFor(() => !engine.isBusy());
+  ok('暂存失败有可见错误', events.some(event =>
+    event.name === 'saveerror' && event.data?.message?.includes('OPFS_FULL')));
+  ok('暂存失败只下载已确认前缀',
+    calls[0] instanceof File && await calls[0].text() === 'first');
+}
+
+{
+  const originalFactory = globalThis.createDurableWriter;
+  globalThis.createDurableWriter = async () => { throw new Error('OPFS_UNAVAILABLE'); };
+  let stopped = false;
+  const isolated = createRecorderEngine({
+    getStream: async () => ({ getTracks: () => [{ stop() { stopped = true; } }] }),
+    saveFile: async () => ({ filename: 'unused.webm' }),
+  });
+  let error = '';
+  try { await isolated.start({ outputFormat: 'webm' }); } catch (value) { error = value.message; }
+  ok('OPFS 初始化失败释放媒体流且不进入录制', error.includes('OPFS_UNAVAILABLE') && stopped && !isolated.isBusy());
+  globalThis.createDurableWriter = originalFactory;
+}
+
+{
+  const originalFactory = globalThis.createDurableWriter;
+  let resolveWriter;
+  let discarded = false;
+  const writer = { bytes: 0, async discard() { discarded = true; } };
+  globalThis.createDurableWriter = () => new Promise(resolve => { resolveWriter = resolve; });
+  const { engine } = engineWith(async () => ({ filename: 'unused.webm' }));
+  const recorderBefore = lastRecorder;
+  const starting = engine.start({ outputFormat: 'webm' });
+  await waitFor(() => !!resolveWriter);
+  engine.stop();
+  resolveWriter(writer);
+  const started = await starting;
+  ok('OPFS 初始化途中取消不会启动幽灵录制', started === false && discarded && lastRecorder === recorderBefore);
+  if (started) engine.discard();
+  globalThis.createDurableWriter = originalFactory;
+}
+
+{
+  const originalSupport = FakeMediaRecorder.isTypeSupported;
+  FakeMediaRecorder.isTypeSupported = () => true;
+  globalThis.recoverMp4Blob = async () => { throw new Error('NO_VALID_MP4'); };
+  const calls = [];
+  const { engine, events } = engineWith(async blob => {
+    calls.push(blob);
+    return { filename: 'invalid.webm' };
+  });
+  const before = durableWriters.length;
+  await engine.start({ outputFormat: 'mp4' });
+  const writer = durableWriters[before];
+  lastRecorder.ondataavailable({ data: new Blob(['first']) });
+  await waitFor(() => writer.bytes === 5);
+  writer.failWith = new Error('OPFS_FULL');
+  lastRecorder.ondataavailable({ data: new Blob(['broken-tail']) });
+  await waitFor(() => !engine.isBusy());
+  ok('原生 MP4 暂存异常归一化失败时不下载', calls.length === 0 && events.some(event =>
+    event.name === 'saveerror' && event.data?.message?.includes('NO_VALID_MP4')));
+  FakeMediaRecorder.isTypeSupported = originalSupport;
+}
+
+{
+  const { engine, events } = engineWith(async () => ({ filename: 'unused.webm' }));
+  const before = durableWriters.length;
+  await engine.start({ outputFormat: 'webm' });
+  const writer = durableWriters[before];
+  let release;
+  writer.appendHold = new Promise(resolve => { release = resolve; });
+  lastRecorder.ondataavailable({ data: new Blob(['pending']) });
+  await waitFor(() => !!writer.appendHold);
+  const discarding = engine.discard();
+  release();
+  await discarding;
+  const stoppedAt = events.findIndex(event => event.name === 'stopped');
+  ok('在途 append 后丢弃不会重建元数据', writer.discarded && stoppedAt >= 0 &&
+    !events.slice(stoppedAt + 1).some(event => event.name === 'durable'));
+}
+
+{
+  const { engine, events } = engineWith(async () => ({ filename: 'unused.webm' }));
+  const before = durableWriters.length;
+  await engine.start({ outputFormat: 'webm' });
+  const writer = durableWriters[before];
+  writer.finalizeError = new Error('WORKER_DEAD');
+  engine.stop();
+  await waitFor(() => events.some(event => event.name === 'saveerror'));
+  ok('finalize 失败释放旧引擎忙态并保留恢复错误', !engine.isBusy() && events.some(event =>
+    event.data?.message?.includes('WORKER_DEAD')));
+}
+
+{
+  const { engine, events } = engineWith(async () => ({ filename: 'cleanup.webm' }));
+  const before = durableWriters.length;
+  await engine.start({ outputFormat: 'webm' });
+  durableWriters[before].discardError = new Error('CLEANUP_FAILED');
+  engine.stop();
+  await waitFor(() => events.some(event => event.name === 'saveerror' || event.name === 'saved'));
+  ok('清理失败不伪造下载收尾成功', events.some(event => event.name === 'saveerror') &&
+    !events.some(event => event.name === 'saved') && engine.isBusy());
+}
+
+{
+  const originalRecorder = globalThis.MediaRecorder;
+  globalThis.MediaRecorder = class {
+    static isTypeSupported() { return true; }
+    constructor() { throw new Error('RECORDER_CONSTRUCTOR_FAILED'); }
+  };
+  const { engine, events } = engineWith(async () => ({ filename: 'unused.webm' }));
+  const before = durableWriters.length;
+  let error = '';
+  try { await engine.start({ outputFormat: 'webm' }); } catch (value) { error = value.message; }
+  ok('MediaRecorder 构造失败回滚 OPFS 和元数据', error.includes('RECORDER_CONSTRUCTOR_FAILED') &&
+    durableWriters[before].discarded && events.some(event => event.name === 'durablecleanup'));
+  globalThis.MediaRecorder = originalRecorder;
+}
+
+{
+  const { engine, events } = engineWith(async () => ({ filename: 'duration.webm' }));
+  const before = durableWriters.length;
+  await engine.start({ outputFormat: 'webm' });
+  const writer = durableWriters[before];
+  let release;
+  writer.finalizeHold = new Promise(resolve => { release = resolve; });
+  engine.stop();
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  release();
+  await waitFor(() => !engine.isBusy());
+  ok('保存排队时间不计入录制时长', events.find(event => event.name === 'stopped')?.data?.historyEntry?.duration === '00:00:00');
 }
 
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n保存引擎测试全部通过 🎉');
