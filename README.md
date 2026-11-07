@@ -110,6 +110,8 @@ WebM 保存时也会补规范的 `SeekHead`，并只为真实视频关键帧建�
 
 **MP4 布局边界**：普通 MP4 即使 `moov` 在末尾，纯 JS faststart 也能处理；**分片 MP4 且 `moov` 在末尾**暂未扩展纯 JS 支持，继续走可选 wasm 兜底。没有 wasm 或兜底失败时保留原始 MP4，不丢录制，但时长/索引可能仍未修复。前因后果、偏移风险与后续验收计划见 [`docs/todo/moov-at-end-fmp4.md`](docs/todo/moov-at-end-fmp4.md)。
 
+**原生 MP4 的 4 GiB Chrome 缺陷（已定位）**：受影响的 Chrome 用 `uint32_t` 累计原生 MP4 输出，超过边界会触发 renderer SIGTRAP，并非 OPFS 或扩展 faststart 导致。Chromium 已在上游提交 `3f057555` 修复；158.0.8127.18、159.0.8148.1 已包含，158.0.8118.0 及本次测试的 156.0.8078.79 未包含。长录制请使用含修复的 Chrome；旧版本改用 WebM，或在其安全阈值内停止保存。复现证据、版本对照与恢复结果见 [`docs/todo/native-mp4-4gib-chrome.md`](docs/todo/native-mp4-4gib-chrome.md)。
+
 > **PotPlayer 打开 MP4 很慢？** 不同 Chrome 版本的分片布局和 mfra 情况不同。扩展已补齐 fMP4 时长，但弱 fMP4 播放器仍可能因逐分片建索引而打开较慢，可用 ffmpeg 重封装改善（流复制，不重编码）：
 > `ffmpeg -i 录制的.mp4 -c copy -movflags +faststart 修复后.mp4`
 
@@ -177,7 +179,10 @@ npm i @ffmpeg/core@0.12.10
 - [ ] 保存期间不出现提前“已保存”，下载完成后才写历史
 - [ ] 模拟一次下载失败 → 重试成功；另一次明确丢弃 → 无历史且可重新录制
 - [ ] 长录制时确认暂存持续增长、内存不随整段线性增长；强杀测试浏览器后恢复 WebM/MP4
-- [ ] 真实 Linux 数小时录制与异常恢复仍需真机验证（自动化短测不替代）
+- [x] Linux/CfT 158：真实 tabCapture WebM 4.5 小时、23.66 GB，正常停止与保存通过（2026-11-06）
+- [x] Linux/Google Chrome 156（保留其他扩展）：YouTube TV NBC 11 真实直播 WebM 5 小时 10 分、16.81 GB，自动停止、下载与前/中/后段解码通过（2026-11-06）
+- [ ] **已复现**：Chrome 156 原生 MP4 在 4,294,540,012 字节（仅比 2³² 少 427,284 字节）处 SIGTRAP，扩展录制上下文消失；OPFS 恢复保存成功，但不能继续超过 4 GiB（2026-11-07）
+- [ ] Windows 与 RDP 长录制仍需对应环境验证（自动化短测不替代）
 - [ ] 桌面 recorder 最小化后停止 → 保存状态与完成提示正常
 - [ ] 切换分辨率 1280×720 → 输出分辨率正确
 - [ ] 窗口模式选择某窗口录制成功

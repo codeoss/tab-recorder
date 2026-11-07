@@ -137,11 +137,14 @@ cp node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.{js,wasm} lib/ffmpeg/
 
 即：内核只服务老版 Chrome 转码与兜底。WebM 输出与全部录制功能**不依赖**该内核；WebM 还会补规范 SeekHead，不能只验证 Chrome 播放，必须验证 Windows Media Foundation / WMP seek。
 
+**原生 MP4 的 4 GiB 边界**：受影响 Chrome 的 `OutputPositionTracker` 用 `uint32_t` 累计输出并 `CHECK`，会触发 renderer SIGTRAP；不是 OPFS 或 JS faststart 能修复的问题。上游提交 `3f057555` 已删除计数器，158.0.8127.18 / 159.0.8148.1 已包含，早期 158 仍可能受影响。详见 `docs/todo/native-mp4-4gib-chrome.md`；旧版本长录制优先 WebM。
+
 ## 测试与验证
 
 **E2E 测试在 `e2e/`**（Playwright + 系统 X11 + xdotool）：`cd e2e && npm i && npm test`。
 - 单元：`unit-webmstream.mjs`（含异常尾部恢复）、`unit-mp4faststart.mjs`、`unit-native-mp4.mjs`、`unit-durable-writer.mjs`（真实 Worker + fake OPFS）、`unit-recovery.mjs`（MP4 完整分片/假成功防护）、`unit-save-state.mjs`、`unit-save-engine.mjs`、`unit-save-ui.mjs`、`unit-popup-save.mjs`、`unit-popup-recorder.mjs`、`unit-recorder-save.mjs`。
 - 场景 A–E：完整录制、倒计时取消竞态、暂停中停止、原生 MP4、保存状态可见；`run-recovery.mjs` 另测 WebM/MP4 强杀重启、offscreen 销毁、重复恢复和明确丢弃，FFmpeg 完整解码且 WebM 不得有 `File ended prematurely`。
+- `node run-long.mjs` 是独立长时压测（默认 4.5 小时，不随 `npm test` 运行）：真实 tabCapture + OPFS，记录 JS 堆、浏览器 RSS/Pss 和扩展上下文，结束后真实下载并抽查前/中/后段解码；`E2E_LONG_MINUTES`、`E2E_LONG_SAMPLE_SECONDS` 可调。
 - Windows 没有 xdotool/WSL 时，可用 `E2E_MANUAL_SHORTCUT=1` 留出真实 Ctrl+Shift+E 按键窗口；`NATIVE_CHROME_BIN` 指定品牌 Chrome 做原生 MP4 测试。默认 Linux 路径与行为不变。
 - 品牌版 Chrome ≥137 禁用 `--load-extension`（E2E 用 Playwright 自带 Chromium/CfT）；CfT 上 offscreen 偶发被提前回收，且管理策略会在真实 reload 后禁用侧载扩展，恢复 E2E 对此明确 SKIP，不能宣称真实 reload 已覆盖。详见 `e2e/run.mjs` / `run-recovery.mjs`。
 
