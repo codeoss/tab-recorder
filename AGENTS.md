@@ -69,10 +69,14 @@ recorder.html / recorder.js     # 窗口/屏幕/兼容模式录制窗口。URL h
                                 # 三种 getStream 实现；保存阶段显示、失败重试、beforeunload 关窗保护
 save-status.html / save-status.js # 标签页专用可见保存窗口：阶段、真实进度、完成、失败重试/丢弃
 save-file.js          # Blob URL 适配器：runtime 交 background 下载，轮询终态后才 revoke
-core-recorder.js      # 公共录制引擎 createRecorderEngine({ getStream, onEvent, releaseExtra, saveFile })。
+core-recorder.js      # 公共录制引擎 createRecorderEngine({ getStream, onEvent, releaseExtra, saveFile, manageResources, beforeSaveProcessing })。
                       # MediaRecorder 生命周期、启动代次、有界待写队列、定时停止；onStopped 异步链：
-                      # 等最后分片确认 → fix-webm / MP4 处理 → await 下载 complete → saved/history；
+                      # 等最后分片确认 → 可选分段门闩 → fix-webm / MP4 处理 → await 下载 complete → saved/history；
                       # 失败保留最终 Blob 与 OPFS，retrySave 只重试下载，明确丢弃才释放
+segment-recorder.js   # 可选同流重叠分段：先启动下一段再停止上一段；provisional/活动段分离，
+                      # 修复/转码/下载按段号串行，停止/暂停/丢弃覆盖启动竞态，失败不伪造会话终态
+durable-store.js      # 多分段恢复元数据：durableRecordings 数组 + 旧 durableRecording 按 ID 合并迁移，
+                      # 所有读改写串行，按 recordingId upsert/remove/clear，禁止跨段覆盖
 durable-recorder.js   # createDurableWriter：最多 4 个/32MiB 待确认分片，元数据等待 background 确认
 durable-writer-worker.js # OPFS createSyncAccessHandle 追加、逐片 flush、确认偏移、finalize/discard；
                       # 不用普通 createWritable 做崩溃暂存（未关闭时探针实测重启为 0 字节）
@@ -106,19 +110,20 @@ icons/                # 16/48/128 PNG 图标
 ```
 
 **HTML 脚本加载顺序是硬性依赖**（offscreen.html 与 recorder.html 一致）：
-`fix-webm.js` → `mp4-faststart.js` → `transcoder.js` → `save-file.js` → `durable-recorder.js` → `recovery.js`（offscreen）→ `core-recorder.js` → 上下文脚本（`offscreen.js` / `recorder.js`）。core-recorder 依赖 `fixWebMBlob` / `fixWebMRecoveryBlob` / `createDurableWriter` / `mp4FaststartJs` / `webmToMp4` / `mp4Faststart`，并由宿主注入 `saveFile: saveFileViaBackground`。
+`fix-webm.js` → `mp4-faststart.js` → `transcoder.js` → `save-file.js` → `durable-recorder.js` → `recovery.js`（offscreen）→ `core-recorder.js` → `segment-recorder.js` → 上下文脚本（`offscreen.js` / `recorder.js`）。background 顶层 `importScripts('durable-store.js')`。core-recorder 依赖 `fixWebMBlob` / `fixWebMRecoveryBlob` / `createDurableWriter` / `mp4FaststartJs` / `webmToMp4` / `mp4Faststart`，并由宿主注入 `saveFile: saveFileViaBackground`。
 
 ## 消息协议（改代码时保持兼容）
 
 - `state.status`：`idle | preparing | countdown | recording | paused`。desktop/compat 创建 recorder 窗口后是 `preparing` 且 `startTime=0`，选择期间不累计录制时长；原生取流取消/失败（`captureFailed:true`）保持 preparing 和原窗口 ID，支持同窗口重试。`RECORDER_STARTED` 仅接受当前 desktop 窗口的 preparing→recording 转换，重复/错误来源不重置计时。准备中 STOP 关闭等待窗口，不进入保存链；聚焦失效经 `windows.get` 确认后清理并允许重开
-- popup → background：`START_RECORDING`（带 `source: 'tab'|'window'|'screen'`、`compatMode`、分辨率/fps/quality/timeLimit/outputFormat/countdownSec 等；非 idle 或保存处理中时会被拒绝——重入守卫）、`STOP/PAUSE/RESUME/DISCARD_RECORDING`、`GET_STATE`（1.5s 轮询）、`OPEN_SAVE_WINDOW`、`RETRY_SAVE`、**desktop/compat 只用 `OPEN_RECORDER_WINDOW` 聚焦原 recorder 窗口，不重复提供停止/暂停入口**
+- popup → background：`START_RECORDING`（带 `source: 'tab'|'window'|'screen'`、`compatMode`、分辨率/fps/quality/timeLimit/outputFormat/countdownSec、`segmentEnabled`/`segmentMinutes` 等；非 idle 或保存处理中时会被拒绝——重入守卫）、`STOP/PAUSE/RESUME/DISCARD_RECORDING`、`GET_STATE`（1.5s 轮询）、`OPEN_SAVE_WINDOW`、`RETRY_SAVE`、**desktop/compat 只用 `OPEN_RECORDER_WINDOW` 聚焦原 recorder 窗口，不重复提供停止/暂停入口**
 - background → 录制引擎：`OFF_START`（仅 offscreen，带 `tabId`）、`OFF_STOP`、`OFF_PAUSE`、`OFF_RESUME`、`OFF_DISCARD`、`OFF_RETRY_SAVE`。tab 模式经 `chrome.runtime.sendMessage`（带 `target: 'offscreen'` 过滤）；desktop 模式经 `chrome.tabs.sendMessage(recorderTabId, ...)`。streamId 不随 OFF_START 下发：`getMediaStreamId` 的 id 应尽快消费，引擎在倒计时/选屏结束后才发 `GET_STREAM_ID`（带 tabId）现取现用
-- 引擎保存文件：`save-file.js` 创建 Blob URL 并发 `SAVE_FILE {url, filename}` 给 background，随后每秒 `GET_DOWNLOAD_STATUS {downloadId}` 直到 complete/interrupted；background 返回真实文件名、路径和 received/total
+- 引擎保存文件：`save-file.js` 创建 Blob URL 并发 `SAVE_FILE {url, filename, recordingId, segmentIndex}` 给 background，随后每秒 `GET_DOWNLOAD_STATUS {downloadId}` 直到 complete/interrupted；background 返回真实文件名、路径和 received/total。分段下载串行，上一段 complete 后才允许下一 recordingId，旧 downloadId/旧事件不得覆盖新任务
 - 引擎 → background：offscreen 发 `RECORDING_STOPPED`、`FILE_SIZE_UPDATE`、`COUNTDOWN_TICK`、`ENGINE_PROCESSING`（含 stage）、`ENGINE_SAVE_ERROR`；recorder 窗口发 `RECORDER_STARTED`、`RECORDER_STOPPED`、`FILE_SIZE_UPDATE`、`ENGINE_PROCESSING`、`ENGINE_SAVE_ERROR`、`ENGINE_PAUSED`/`ENGINE_RESUMED`。停止时带 `historyEntry`（仅在下载 complete 后）与可选 `discarded`；取流取消/失败另带 `captureFailed:true`，与最终 stopped 区分
-- 持续暂存：`durable` → `DURABLE_UPDATE {patch}`，background await 写入 `chrome.storage.local.durableRecording` 后才确认 append；不同 id 不得覆盖。清理顺序：停止更新 → 等 writer 删除 OPFS → `DURABLE_CLEANUP` 按 id 删元数据 → stopped。清理失败不得伪造成功。`SAVE_FILE` 先持久化含 Blob URL 的 downloadIntent，再立即写 downloadId，覆盖 id 尚未落盘的崩溃窗口
-- 异常恢复：popup/save-status 发 `RECOVER_RECORDING` / `DISCARD_RECOVERY`；background 共用 `recoveryInFlight` 互斥，先对账已有下载，再经 offscreen `OFF_RECOVER_RECORDING` / `OFF_DISCARD_RECOVERY`。offscreen 另发独立 `RECOVERY_COMPLETE`，SW 重启后主动接续，完成不依赖原消息通道。`historyEntry.recordingId` 去重。只有无存活 owner 才开放恢复；desktop 窗口销毁同样检查暂存
+- 分段事件：`segment {phase:'started'|'saved',recordingId,segmentIndex,sessionId}` 映射为 `SEGMENT_STARTED` / `SEGMENT_SAVED`。段级 processing 带 `scope:'segment'`、`sessionId` 和 `recordingId`，background 用 `processingSegmentIds` 按段隔离完成事件，旧段不得清掉新段状态或改成 idle；`SEGMENT_SAVED` 仅在真实 complete 后经串行历史队列写入并按 ID 去重。recorder 在旧段保存时仍可暂停/停止当前录制，只有会话级 finalizing 禁用控制
+- 持续暂存：`durable` → `DURABLE_UPDATE {patch}`，background 经 `durable-store.js` 串行写入 `chrome.storage.local.durableRecordings` 数组后才确认 append；同 id 更新不重复，不同 id 合法共存。旧单个 `durableRecording` 与数组按 recordingId 合并去重，下一次写入迁移删除。清理顺序：停止更新 → 等 writer 删除 OPFS → `DURABLE_CLEANUP` 按 id 删元数据 → stopped。清理失败不得伪造成功。`SAVE_FILE` 按 recordingId 持久化含 Blob URL 的 downloadIntent，再立即写 downloadId，覆盖 id 尚未落盘的崩溃窗口
+- 异常恢复：popup/save-status 发 `RECOVER_RECORDING` / `DISCARD_RECOVERY`；background 共用 `recoveryInFlight` 互斥，先对账已有下载，再按 sessionId + segmentIndex + startedAt 逐项经 offscreen `OFF_RECOVER_RECORDING` / `OFF_DISCARD_RECOVERY`。offscreen 的恢复 Promise 每次结束都复位，background 拒绝 ID 不匹配结果；另发独立 `RECOVERY_COMPLETE`，SW 重启后主动接续，完成不依赖原消息通道。每项 complete 才删除，集合为空才清恢复态；`historyEntry.recordingId` 去重。只有无存活 owner 才开放恢复；desktop 窗口销毁同样检查暂存。明确丢弃保留下载文件，但删除所有对应 OPFS 副本
 
-引擎内部事件（`onEvent` 回调）：`started / paused / resumed / tick / size / durable / processing({active,stage}) / saveerror / stopped / saved`。
+引擎内部事件（`onEvent` 回调）：`started / paused / resumed / tick / size / durable / processing({active,stage}) / saveerror / stopped / saved`；分段另有 `segment {phase,recordingId,segmentIndex,sessionId}`。
 
 ## MP4 输出（可选，三档自动降级）
 
@@ -142,10 +147,11 @@ cp node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.{js,wasm} lib/ffmpeg/
 ## 测试与验证
 
 **E2E 测试在 `e2e/`**（Playwright + 系统 X11 + xdotool）：`cd e2e && npm i && npm test`。
-- 单元：`unit-webmstream.mjs`（含异常尾部恢复）、`unit-mp4faststart.mjs`、`unit-native-mp4.mjs`、`unit-durable-writer.mjs`（真实 Worker + fake OPFS）、`unit-recovery.mjs`（MP4 完整分片/假成功防护）、`unit-save-state.mjs`、`unit-save-engine.mjs`、`unit-save-ui.mjs`、`unit-popup-save.mjs`、`unit-popup-recorder.mjs`、`unit-recorder-save.mjs`。
-- 场景 A–E：完整录制、倒计时取消竞态、暂停中停止、原生 MP4、保存状态可见；`run-recovery.mjs` 另测 WebM/MP4 强杀重启、offscreen 销毁、重复恢复和明确丢弃，FFmpeg 完整解码且 WebM 不得有 `File ended prematurely`。
+- 单元：`unit-webmstream.mjs`（含异常尾部恢复）、`unit-mp4faststart.mjs`、`unit-native-mp4.mjs`、`unit-durable-writer.mjs`（真实 Worker + fake OPFS）、`unit-recovery.mjs`（MP4 完整分片/假成功防护）、`unit-durable-store.mjs`（多段迁移/串行写）、`unit-segment-recorder.mjs`（真实核心的重叠/背压/控制）、`unit-save-state.mjs`、`unit-save-engine.mjs`、`unit-save-ui.mjs`、`unit-popup-save.mjs`、`unit-popup-recorder.mjs`、`unit-recorder-save.mjs`。
+- 场景 A–G：完整录制、倒计时取消竞态、暂停中停止、原生 MP4、保存状态可见、WebM/MP4 多分段；`run-recovery.mjs` 另测 WebM/MP4 强杀重启、多分段顺序恢复、offscreen 销毁、重复恢复和明确丢弃，FFmpeg 完整解码且 WebM 不得有 `File ended prematurely`。测试构建可把分段间隔缩短到秒级，生产 UI 分钟整数不变。
 - `node run-long.mjs` 是独立长时压测（默认 4.5 小时，不随 `npm test` 运行）：真实 tabCapture + OPFS，记录 JS 堆、浏览器 RSS/Pss 和扩展上下文，结束后真实下载并抽查前/中/后段解码；`E2E_LONG_MINUTES`、`E2E_LONG_SAMPLE_SECONDS` 可调。
-- Windows 没有 xdotool/WSL 时，可用 `E2E_MANUAL_SHORTCUT=1` 留出真实 Ctrl+Shift+E 按键窗口；`NATIVE_CHROME_BIN` 指定品牌 Chrome 做原生 MP4 测试。默认 Linux 路径与行为不变。
+- Windows 没有 xdotool/WSL 时，可用 `E2E_MANUAL_SHORTCUT=1` 留出真实 Ctrl+Shift+E 按键窗口（`E2E_SHORTCUT_WAIT_MS` 调等待时长）；`NATIVE_CHROME_BIN` 指定品牌 Chrome 做原生 MP4 测试。默认 Linux 路径与行为不变。
+- Playwright 可能把最终落盘文件改成 GUID（品牌 Chrome 连接 CDP 也一样）；不能据此断言生产文件名错误，也不能把这种环境当成 `_partNNN` 最终文件名的验收。
 - 品牌版 Chrome ≥137 禁用 `--load-extension`（E2E 用 Playwright 自带 Chromium/CfT）；CfT 上 offscreen 偶发被提前回收，且管理策略会在真实 reload 后禁用侧载扩展，恢复 E2E 对此明确 SKIP，不能宣称真实 reload 已覆盖。详见 `e2e/run.mjs` / `run-recovery.mjs`。
 
 **手工验证仍不可替代**（云桌面兼容模式等需要真实 RDP 环境）：

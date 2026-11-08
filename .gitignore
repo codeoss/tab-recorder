@@ -28,6 +28,8 @@ e2e/downloads/
 e2e/.recovery-profile/
 e2e/.recovery-ext-build/
 e2e/recovery-downloads/
+e2e/.native-chrome-profile/
+e2e/downloads-native-*/
 
 # ===== 录制输出（开发/测试时可能落地的音视频文件）=====
 *.webm

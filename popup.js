@@ -17,6 +17,7 @@ const el = {
   pta: $('pta'), ptaRow: $('ptaRow'),
   compat: $('compat'), compatRow: $('compatRow'), compatNote: $('compatNote'),
   cd: $('cd'), cdRow: $('cdRow'),
+  segmentEnabled: $('segmentEnabled'), segmentMinutesRow: $('segmentMinutesRow'), segmentMinutes: $('segmentMinutes'),
   fmt: $('fmt'),
   tlH: $('tlH'), tlM: $('tlM'), tlS: $('tlS'),
   hist: $('hist'), deskNote: $('deskNote'),
@@ -65,7 +66,8 @@ function events() {
     save();
   }));
 
-  [el.res, el.fps, el.qual, el.pta, el.compat, el.cd, el.fmt, el.tlH, el.tlM, el.tlS].forEach(
+  [el.res, el.fps, el.qual, el.pta, el.compat, el.cd, el.fmt, el.segmentEnabled, el.segmentMinutes,
+    el.tlH, el.tlM, el.tlS].forEach(
     e => e.addEventListener('change', () => { updateSourceUI(); save(); })
   );
 }
@@ -78,6 +80,7 @@ function updateSourceUI() {
   // 「保持标签页声音」仅对普通标签页模式（兼容模式不劫持音频）
   el.ptaRow.classList.toggle('hidden', !isTab || isCompat);
   el.cdRow.classList.toggle('hidden', !isTab);
+  el.segmentMinutesRow.classList.toggle('hidden', !el.segmentEnabled.checked);
   // 桌面 / 兼容模式都弹独立窗口
   el.deskNote.classList.toggle('hidden', isTab && !isCompat);
 
@@ -103,6 +106,8 @@ function save() {
     fps: parseInt(el.fps.value) || 30,
     quality: el.qual.value,
     outputFormat: el.fmt.value,
+    segmentEnabled: el.segmentEnabled.checked,
+    segmentMinutes: el.segmentMinutes.value || '30',
     tlH: el.tlH.value, tlM: el.tlM.value, tlS: el.tlS.value,
   }});
 }
@@ -118,6 +123,8 @@ async function restore() {
     el.fps.value = String(s.fps || 30);
     el.qual.value = s.quality || '8000000';
     el.fmt.value = s.outputFormat || 'webm';
+    el.segmentEnabled.checked = s.segmentEnabled === true;
+    el.segmentMinutes.value = s.segmentMinutes || '30';
     el.tlH.value = s.tlH || '0';
     el.tlM.value = s.tlM || '0';
     el.tlS.value = s.tlS || '0';
@@ -168,6 +175,15 @@ async function start() {
   el.rec.style.pointerEvents = 'none';
   status('rdy', '准备中...');
 
+  const segmentEnabled = el.segmentEnabled.checked;
+  const segmentMinutes = Number(el.segmentMinutes.value);
+  if (segmentEnabled && (!Number.isInteger(segmentMinutes) || segmentMinutes < 1 || segmentMinutes > 1440)) {
+    state = 'idle'; ui();
+    status('rdy', '分段分钟需为 1–1440 的整数');
+    el.rec.style.pointerEvents = 'auto';
+    return;
+  }
+
   const isCompatTab = src === 'tab' && el.compat.checked;
   // 仅普通标签页模式走倒计时（兼容/桌面模式会弹独立窗口）
   const countdownSec = (src === 'tab' && !isCompatTab) ? (parseInt(el.cd.value) || 0) : 0;
@@ -185,6 +201,7 @@ async function start() {
       quality: el.qual.value,
       timeLimit: timeLimitSec(),
       outputFormat: el.fmt.value,
+      segmentEnabled, segmentMinutes,
       countdownSec,
     });
     if (res?.error) throw new Error(res.error);
@@ -351,7 +368,9 @@ function renderSaveState(bg) {
   if (recoveryMode && !bg.recoveryBusy && phase !== 'processing' && phase !== 'downloading') {
     el.saveText.textContent = phase === 'error'
       ? '恢复失败：' + (bg.saveError || '未知错误') : '发现未完成的录制';
-    el.saveProgress.textContent = `已暂存 ${fmtMB(bg.durableBytes)}，尚未下载；可恢复保存或明确丢弃`;
+    el.saveProgress.textContent = bg.recoveryCount > 1
+      ? `发现 ${bg.recoveryCount} 个未完成分段，共 ${fmtMB(bg.durableBytes)}，尚未下载；按段号恢复或明确丢弃`
+      : `已暂存 ${fmtMB(bg.durableBytes)}，尚未下载；可恢复保存或明确丢弃`;
     ui();
     status(phase === 'error' ? 'pau' : 'rdy', phase === 'error' ? '恢复失败，可重试' : '录制尚未保存，请恢复或丢弃');
     return;
@@ -387,6 +406,9 @@ function renderSaveState(bg) {
       detail = '完成前请勿关闭浏览器';
     }
     statusText = phase === 'downloading' ? '正在保存到下载目录…' : '正在保存/整理视频…';
+  }
+  if (bg.segmented && bg.status !== 'idle' && bg.savingSegments > 0) {
+    title = `正在保存第 ${bg.savingSegmentIndex || bg.segmentIndex || 1} 段，录制继续`;
   }
   el.saveText.textContent = title;
   el.saveProgress.textContent = detail;

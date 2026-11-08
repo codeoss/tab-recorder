@@ -26,11 +26,13 @@ function element(id) {
       toggle: (name, force) => { if (force) classes.add(name); else classes.delete(name); },
       contains: name => classes.has(name),
     },
-    addEventListener() {},
+    listeners: {},
+    addEventListener(type, fn) { this.listeners[type] = fn; },
+    async change() { return await this.listeners.change?.(); },
   };
 }
 
-function popupWith(bg, { source = 'tab', compat = false, responses = {} } = {}) {
+function popupWith(bg, { source = 'tab', compat = false, responses = {}, settings = null } = {}) {
   const elements = new Map();
   const messages = [];
   const intervals = [];
@@ -50,7 +52,7 @@ function popupWith(bg, { source = 'tab', compat = false, responses = {} } = {}) 
         if (msg.type === 'GET_STATE') return { ...bg };
         return { ok: 1, ...responses[msg.type] };
       } },
-      storage: { local: { get: (_key, cb) => cb({}), set() {} } },
+      storage: { local: { get: (_key, cb) => cb(settings ? { recorderSettings: settings } : {}), set() {} } },
     },
     setTimeout: () => 1,
     setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; },
@@ -59,7 +61,7 @@ function popupWith(bg, { source = 'tab', compat = false, responses = {} } = {}) 
   };
   const script = fs.readFileSync(path.join(ROOT, 'popup.js'), 'utf8').replace(/\r\n/g, '\n') +
     `\nsrc = ${JSON.stringify(source)}; el.compat.checked = ${compat};\n` +
-    'globalThis.__popupTest = { start, stop, toggle, togglePause, pollState, el,\n' +
+    'globalThis.__popupTest = { start, stop, toggle, togglePause, pollState, events, updateSourceUI, restore, el,\n' +
     '  get state() { return state; }, get tickActive() { return tick !== null; },\n' +
     '  get startTime() { return bgStart; } };\n';
   vm.runInNewContext(script, context, { filename: 'popup.js' });
@@ -137,6 +139,43 @@ for (const status of ['preparing', 'recording', 'paused']) {
   await h.test.toggle();
   ok('普通 tab 保留停止控制', h.messages.some(x => x.type === 'STOP_RECORDING') &&
     !h.messages.some(x => x.type === 'OPEN_RECORDER_WINDOW'), JSON.stringify(h.messages));
+}
+
+{
+  const h = popupWith({ status: 'idle', mode: '' });
+  h.test.events();
+  ok('分段默认独立开关关闭且分钟行隐藏', h.test.el.segmentEnabled?.checked === false &&
+    !!h.test.el.segmentMinutesRow && h.test.el.segmentMinutesRow.classList.contains('hidden'));
+  if (h.test.el.segmentEnabled) {
+    h.test.el.segmentEnabled.checked = true;
+    await h.test.el.segmentEnabled.change();
+  }
+  ok('打开分段开关才显示分钟输入', !!h.test.el.segmentMinutesRow &&
+    !h.test.el.segmentMinutesRow.classList.contains('hidden'));
+  if (h.test.el.segmentMinutes) h.test.el.segmentMinutes.value = '30';
+  await h.test.start();
+  const started = h.messages.find(x => x.type === 'START_RECORDING');
+  ok('合法分段设置进入 START_RECORDING', started?.segmentEnabled === true && started?.segmentMinutes === 30,
+    JSON.stringify(started));
+}
+
+for (const value of ['0', '1.5', '']) {
+  const h = popupWith({ status: 'idle', mode: '' });
+  if (h.test.el.segmentEnabled) h.test.el.segmentEnabled.checked = true;
+  if (h.test.el.segmentMinutes) h.test.el.segmentMinutes.value = value;
+  await h.test.start();
+  ok(`非法分段分钟 ${JSON.stringify(value)} 被拒绝`, !h.messages.some(x => x.type === 'START_RECORDING') &&
+    h.test.el.stxt.textContent.includes('分段'), h.test.el.stxt.textContent);
+}
+
+{
+  const h = popupWith({ status: 'idle', mode: '' }, { settings: {
+    segmentEnabled: true, segmentMinutes: '45', quality: '16000000', outputFormat: 'mp4',
+  } });
+  await h.test.restore();
+  ok('恢复分段设置不影响其他配置', h.test.el.segmentEnabled?.checked === true &&
+    h.test.el.segmentMinutes?.value === '45' && h.test.el.qual.value === '16000000' &&
+    h.test.el.fmt.value === 'mp4');
 }
 
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n录制窗口状态测试全部通过 🎉');

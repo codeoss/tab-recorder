@@ -1,6 +1,6 @@
 /**
- * 验证桌面 recorder 保存状态：处理中禁用控制、关窗保护、
- * 可重试失败操作、真实下载进度和 saved 后自动关闭。
+ * 验证桌面 recorder：段级保存保留会话控制、会话级收尾禁用控制、
+ * 失败重试入口不被后续事件隐藏、真实下载进度和 saved 后自动关闭。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -61,14 +61,19 @@ const context = {
 };
 let retries = 0;
 let discards = 0;
-context.createRecorderEngine = () => ({
+let normalEngines = 0;
+let segmentedEngines = 0;
+const fakeEngine = () => ({
+  start: async () => true,
   isBusy: () => true,
   retrySave: async () => { retries++; return true; },
   discard: () => { discards++; },
 });
+context.createRecorderEngine = () => { normalEngines++; return fakeEngine(); };
+context.createSegmentedRecorderEngine = () => { segmentedEngines++; return fakeEngine(); };
 vm.runInNewContext(
   fs.readFileSync(path.join(ROOT, 'recorder.js'), 'utf8').replace(/\r\n/g, '\n') +
-    '\nglobalThis.__recorderTest = { onEvent, setEngine: e => { engine = e; }, pollSaveState: typeof pollSaveState === "function" ? pollSaveState : null };\n',
+    '\nglobalThis.__recorderTest = { onEvent, startRecording, setEngine: e => { engine = e; }, enableSegments: () => { config.segmentEnabled = true; config.segmentMinutes = 1; }, pollSaveState: typeof pollSaveState === "function" ? pollSaveState : null };\n',
   context,
   { filename: 'recorder.js' },
 );
@@ -79,8 +84,12 @@ const el = id => {
 };
 test.setEngine(context.createRecorderEngine());
 
-test.onEvent('processing', { active: true, stage: 'download' });
-ok('保存中禁用暂停和停止', el('pauseBtn').disabled === true && el('stopBtn').disabled === true);
+test.onEvent('processing', { active: true, stage: 'download', scope: 'segment', segmentIndex: 1 });
+ok('段级保存显示段号且录制继续', el('stxt').textContent.includes('第 1 段') &&
+  el('stxt').textContent.includes('录制继续'));
+ok('旧段保存时仍可暂停和停止当前录制', el('pauseBtn').disabled === false && el('stopBtn').disabled === false);
+test.onEvent('processing', { active: true, stage: 'webm-fix' });
+ok('会话级收尾才禁用暂停和停止', el('pauseBtn').disabled === true && el('stopBtn').disabled === true);
 const busyEvent = { preventDefault() {}, returnValue: '' };
 listeners.beforeunload?.(busyEvent);
 ok('保存中 beforeunload 保持保护', !!busyEvent.returnValue);
@@ -89,6 +98,9 @@ test.onEvent('saveerror', { message: 'FILE_NO_SPACE' });
 ok('可恢复失败显示重试和丢弃', el('retrySaveBtn') && el('retrySaveBtn').hidden === false &&
    el('discardSaveBtn') && el('discardSaveBtn').hidden === false &&
    el('stxt').textContent.includes('文件仍保留'));
+test.onEvent('processing', { active: true, stage: 'webm-fix', scope: 'segment', segmentIndex: 2 });
+ok('后续段级事件不隐藏保存失败与重试入口', el('retrySaveBtn').hidden === false &&
+  el('discardSaveBtn').hidden === false && el('stxt').textContent.includes('保存失败'));
 await el('retrySaveBtn').click();
 await el('discardSaveBtn').click();
 ok('重试和丢弃调用真实引擎方法', retries === 1 && discards === 1);
@@ -103,6 +115,12 @@ if (typeof test.pollSaveState !== 'function') {
 test.onEvent('saved', { filename: 'done.webm' });
 ok('saved 后显示完成并延时关窗', el('stxt').textContent.includes('已保存') &&
    timeouts.some(x => x.ms === 2000));
+
+await test.startRecording();
+ok('默认 recorder 使用原核心引擎', normalEngines > 0 && segmentedEngines === 0);
+test.enableSegments();
+await test.startRecording();
+ok('打开分段后 recorder 使用分段控制器', segmentedEngines === 1);
 
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n桌面保存状态测试全部通过 🎉');
 process.exit(failed ? 1 : 0);

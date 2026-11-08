@@ -161,6 +161,14 @@
           </select></div>
         </div>
         <div class="or">
+          <div class="ol"><span class="oi">🧩</span><span class="ot">分段录制</span></div>
+          <label class="tg"><input type="checkbox" id="segmentEnabled"><span class="ts"></span></label>
+        </div>
+        <div class="or hidden" id="segmentMinutesRow">
+          <div class="ol"><span class="oi">⏱️</span><span class="ot">每段时长（分钟）</span><span class="hint">旧版 MP4 建议≤30</span></div>
+          <input type="number" class="tli" id="segmentMinutes" min="1" max="1440" step="1" value="30">
+        </div>
+        <div class="or">
           <div class="ol"><span class="oi">⏳</span><span class="ot">定时停止</span><span class="hint">0=不限</span></div>
           <div class="tlr">
             <input type="number" class="tli" id="tlH" min="0" max="99" value="0"><span class="tlu">时</span>
