@@ -40,8 +40,10 @@
    * @param {(name: string, data?: Object) => void} [opts.onEvent]
    * @param {() => void} [opts.releaseExtra]
    * @param {(blob: Blob, filename: string) => Promise<{filename: string, path: string}>} opts.saveFile
+   * @param {boolean} [opts.manageResources=true] false 表示媒体流与额外资源由外层会话统一释放。
+   * @param {() => Promise<void>} [opts.beforeSaveProcessing] 分段会话用来串行修复、转码与下载的门闩。
    */
-  function createRecorderEngine({ getStream, onEvent, releaseExtra, saveFile }) {
+  function createRecorderEngine({ getStream, onEvent, releaseExtra, saveFile, manageResources = true, beforeSaveProcessing }) {
     const emit = (name, data) => { try { return onEvent && onEvent(name, data); } catch (_) { return undefined; } };
 
     // ── 引擎状态 ─────────────────────────────────────────
@@ -135,6 +137,12 @@
             emit('saveerror', { message: `暂存失败：${error.message}`, canRetry: true });
             if (recorder && recorder.state !== 'inactive') stop();
           });
+        };
+        recorder.onerror = event => {
+          const error = event.error || {};
+          const message = error.message || error.name || event.message || 'MediaRecorder error';
+          emit('saveerror', { message: `录制错误：${message}`, canRetry: true });
+          if (recorder && recorder.state !== 'inactive') stop();
         };
         recorder.onstop = () => onStopped();
 
@@ -302,6 +310,14 @@
       }
 
       const durMs = stopDurationMs !== null ? stopDurationMs : elapsed();
+      if (beforeSaveProcessing) {
+        try { await beforeSaveProcessing(); }
+        catch (error) {
+          isProcessing = false;
+          emit('saveerror', { message: `无法进入保存队列：${error.message}`, canRetry: true });
+          return;
+        }
+      }
       emit('processing', { active: true, stage: recordedIsMp4 ? 'mp4-fix' : 'webm-fix' });
 
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -407,6 +423,8 @@
     }
 
     function releaseAll() {
+      // 分段会话共享流由控制器统一释放，段级停止不得影响下一段。
+      if (!manageResources) { activeStream = null; return; }
       // 主流由 core 管理（就是 getStream 返回、喂给 MediaRecorder 的那条）
       if (activeStream) {
         try { activeStream.getTracks().forEach(t => t.stop()); } catch (_) {}

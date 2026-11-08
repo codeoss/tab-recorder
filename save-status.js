@@ -39,7 +39,9 @@
       el.title.textContent = phase === 'error' ? '恢复失败' : '发现未完成的录制';
       el.detail.textContent = phase === 'error'
         ? (state.saveError || '未知错误') + '。暂存文件仍保留，可重试或明确丢弃。'
-        : `已暂存 ${mb(state.durableBytes)} MB，尚未保存到下载目录。`;
+        : state.recoveryCount > 1
+          ? `发现 ${state.recoveryCount} 个未完成分段，共 ${mb(state.durableBytes)} MB，尚未保存到下载目录。`
+          : `已暂存 ${mb(state.durableBytes)} MB，尚未保存到下载目录。`;
       el.retryBtn.hidden = false;
       el.discardBtn.hidden = false;
       el.progressText.textContent = '恢复保存完成后才可安全删除暂存';
@@ -58,7 +60,9 @@
     }
 
     if (phase === 'downloading') {
-      el.title.textContent = '正在保存到下载目录';
+      el.title.textContent = state.segmented && state.status !== 'idle' && state.savingSegments > 0
+        ? `正在保存第 ${state.savingSegmentIndex || state.segmentIndex || 1} 段，录制继续`
+        : '正在保存到下载目录';
       el.detail.textContent = '请勿关闭浏览器，文件尚未保存完成。';
       if (state.saveTotal > 0) {
         const percent = Math.min(100, Math.floor(state.saveReceived / state.saveTotal * 100));

@@ -8,10 +8,10 @@
 (function (G) {
   'use strict';
 
-  async function saveFileViaBackground(blob, filename) {
+  async function saveFileViaBackground(blob, filename, extra = {}) {
     const url = URL.createObjectURL(blob);
     try {
-      const started = await chrome.runtime.sendMessage({ type: 'SAVE_FILE', url, filename });
+      const started = await chrome.runtime.sendMessage({ type: 'SAVE_FILE', url, filename, ...extra });
       if (!started || started.error || !started.downloadId) {
         throw new Error((started && started.error) || '无法启动下载');
       }

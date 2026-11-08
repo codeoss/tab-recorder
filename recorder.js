@@ -19,6 +19,8 @@
  */
 
 let engine = null;
+let sessionFinalizing = false;
+let saveErrorVisible = false;
 let screenAudioStream = null;   // 兼容模式 getDisplayMedia 的系统音频流
 let limitMs = 0;
 
@@ -54,6 +56,8 @@ function getConfig() {
     timeLimit:   parseInt(p.get('timeLimit')) || 0,
     tabId:       parseInt(p.get('tabId'))  || 0,
     outputFormat:p.get('outputFormat') || 'webm',
+    segmentEnabled: p.get('segmentEnabled') === '1',
+    segmentMinutes: parseInt(p.get('segmentMinutes')) || 30,
   };
 }
 
@@ -137,11 +141,12 @@ async function startRecording() {
   // 否则重复点击会创建两个 engine，第一路的流失去引用泄漏
   startBtn.disabled = true;
 
-  engine = createRecorderEngine({
+  const engineFactory = config.segmentEnabled ? createSegmentedRecorderEngine : createRecorderEngine;
+  engine = engineFactory({
     getStream: () => getCaptureStream(),
     onEvent:   (name, data) => onEvent(name, data),
     releaseExtra: () => releaseExtraStreams(),
-    saveFile: (blob, filename) => saveFileViaBackground(blob, filename),
+    saveFile: (blob, filename, extra) => saveFileViaBackground(blob, filename, extra),
   });
 
   let ok = false;
@@ -150,6 +155,7 @@ async function startRecording() {
       quality: config.quality,
       timeLimit: config.timeLimit,
       outputFormat: config.outputFormat,
+      segmentMinutes: config.segmentMinutes,
     });
   } catch (error) {
     showError(error.message || String(error));
@@ -264,6 +270,10 @@ async function startDesktopCapture() {
 function onEvent(name, data) {
   switch (name) {
     case 'started':
+      sessionFinalizing = false;
+      saveErrorVisible = false;
+      pauseBtn.disabled = false;
+      stopBtn.disabled = false;
       setStatus('rec', '录制中');
       pauseBtn.textContent = '⏸ 暂停';
       dot.classList.remove('paused');
@@ -299,6 +309,11 @@ function onEvent(name, data) {
     case 'durablecleanup':
       return notifyCritical('DURABLE_CLEANUP', { id: data && data.id });
 
+    case 'segment':
+      if (data && data.phase === 'started') notifyBg('SEGMENT_STARTED', { ...data });
+      if (data && data.phase === 'saved') notifyBg('SEGMENT_SAVED', { ...data });
+      break;
+
     case 'processing': {
       const stages = {
         'webm-fix': '正在整理 WebM 索引',
@@ -306,23 +321,36 @@ function onEvent(name, data) {
         transcode: '正在转码',
         download: '正在保存到下载目录',
       };
+      if (data.scope !== 'segment') sessionFinalizing = !!data.active;
       if (data.active) {
-        stxt.textContent = stages[data.stage] || '正在整理视频';
-        saveProgress.textContent = '完成前请勿关闭浏览器';
-        pauseBtn.disabled = true;
-        stopBtn.disabled = true;
-        retrySaveBtn.hidden = true;
-        discardSaveBtn.hidden = true;
+        if (!saveErrorVisible) {
+          stxt.textContent = data.scope === 'segment'
+            ? `正在保存第 ${data.segmentIndex || 1} 段，录制继续`
+            : stages[data.stage] || '正在整理视频';
+          saveProgress.textContent = '完成前请勿关闭浏览器';
+        }
+        pauseBtn.disabled = sessionFinalizing;
+        stopBtn.disabled = sessionFinalizing;
+        retrySaveBtn.hidden = !saveErrorVisible;
+        discardSaveBtn.hidden = !saveErrorVisible;
         dot.style.animation = 'none';
       } else {
-        pauseBtn.disabled = false;
-        stopBtn.disabled = false;
+        pauseBtn.disabled = sessionFinalizing;
+        stopBtn.disabled = sessionFinalizing;
       }
-      notifyBg('ENGINE_PROCESSING', { active: !!data.active, stage: data.stage });
+      notifyBg('ENGINE_PROCESSING', {
+        active: !!data.active, stage: data.stage,
+        scope: data.scope, segmentIndex: data.segmentIndex,
+        recordingId: data.recordingId, sessionId: data.sessionId,
+      });
       break;
     }
 
     case 'saveerror':
+      saveErrorVisible = true;
+      sessionFinalizing = true;
+      pauseBtn.disabled = true;
+      stopBtn.disabled = true;
       stxt.textContent = '保存失败：' + (data && data.message) + '，文件仍保留';
       saveProgress.textContent = '可重试保存，或明确选择丢弃';
       retrySaveBtn.hidden = false;
@@ -333,6 +361,7 @@ function onEvent(name, data) {
       break;
 
     case 'stopped':
+      saveErrorVisible = false;
       retrySaveBtn.hidden = true;
       discardSaveBtn.hidden = true;
       notifyBg('RECORDER_STOPPED', {
@@ -348,6 +377,7 @@ function onEvent(name, data) {
       break;
 
     case 'saved':
+      saveErrorVisible = false;
       retrySaveBtn.hidden = true;
       discardSaveBtn.hidden = true;
       saveProgress.textContent = '';

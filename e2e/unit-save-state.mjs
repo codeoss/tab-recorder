@@ -17,7 +17,9 @@ function ok(name, condition, extra = '') {
 function harness(initialState = null, durableRecording = null) {
   const listeners = {};
   const session = initialState ? { recorderState: initialState } : {};
-  const local = durableRecording ? { durableRecording } : {};
+  const local = durableRecording
+    ? (Array.isArray(durableRecording) ? { durableRecordings: durableRecording } : { durableRecording })
+    : {};
   const sent = [];
   const items = new Map();
   const contexts = [{ contextType: 'OFFSCREEN_DOCUMENT' }];
@@ -56,12 +58,12 @@ function harness(initialState = null, durableRecording = null) {
       },
       local: {
         get(key, cb) {
-          const result = { [key]: local[key] };
+          const result = Object.fromEntries((Array.isArray(key) ? key : [key]).map(name => [name, local[name]]));
           if (cb) { cb(result); return; }
           return Promise.resolve(result);
         },
         async set(values, cb) { Object.assign(local, values); if (cb) cb(); },
-        async remove(key) { delete local[key]; },
+        async remove(key) { for (const name of Array.isArray(key) ? key : [key]) delete local[name]; },
       },
     },
     action: {
@@ -92,9 +94,12 @@ function harness(initialState = null, durableRecording = null) {
       async cancel() { throw new Error('下载不应被取消'); },
     },
   };
-  vm.runInNewContext(fs.readFileSync(path.join(ROOT, 'background.js'), 'utf8'), {
-    chrome, console, URLSearchParams, setTimeout, clearTimeout,
-  }, { filename: 'background.js' });
+  const sandbox = { chrome, console, URLSearchParams, setTimeout, clearTimeout };
+  sandbox.self = sandbox;
+  vm.createContext(sandbox);
+  sandbox.importScripts = file => vm.runInContext(
+    fs.readFileSync(path.join(ROOT, file), 'utf8'), sandbox, { filename: file });
+  vm.runInContext(fs.readFileSync(path.join(ROOT, 'background.js'), 'utf8'), sandbox, { filename: 'background.js' });
   if (!listeners.downloadChanged) listeners.downloadChanged = async () => {};
   async function send(type, extra = {}, sender = {}) {
     return new Promise((resolve, reject) => {
@@ -656,9 +661,11 @@ function recoveryMeta(id = 'r1') {
     }
 
     const success = adapterHarness('complete');
-    const saved = await success.context.self.saveFileViaBackground({}, 'a.webm');
+    const saved = await success.context.self.saveFileViaBackground({}, 'a.webm', { recordingId: 'seg1', segmentIndex: 1 });
     ok('适配器在 complete 后返回真实文件名', saved.filename === 'a (1).webm' &&
        saved.path === 'C:/Downloads/a (1).webm');
+    ok('适配器透传分段标识', success.messages.find(x => x.type === 'SAVE_FILE')?.recordingId === 'seg1' &&
+       success.messages.find(x => x.type === 'SAVE_FILE')?.segmentIndex === 1);
     ok('适配器仅在终态后 revoke 一次', success.revoked.length === 1 && success.revoked[0] === 'blob:test' &&
        success.messages.filter(x => x.type === 'GET_DOWNLOAD_STATUS').length === 3);
 
@@ -668,6 +675,207 @@ function recoveryMeta(id = 'r1') {
     catch (error) { saveError = error.message; }
     ok('适配器传播下载失败并 revoke', saveError.includes('FILE_NO_SPACE') && failure.revoked.length === 1);
   }
+}
+
+{
+  const h = harness({ status: 'recording', mode: 'tab', segmented: true, segmentIndex: 1,
+    savedSegments: 0, savingSegments: 0, processing: false });
+  await h.send('ENGINE_PROCESSING', { active: true, stage: 'webm-fix', scope: 'segment', segmentIndex: 1 });
+  let state = await h.send('GET_STATE');
+  ok('段级处理保持 recording 并显示保存段数', state.status === 'recording' && state.savingSegments === 1 &&
+    state.savePhase === 'processing');
+  const first = await h.send('SAVE_FILE', {
+    url: 'blob:chrome-extension://x/seg1', filename: 'part1.webm', recordingId: 'seg1', segmentIndex: 1,
+  });
+  h.patch(first.downloadId, { state: 'complete', bytesReceived: 100, filename: 'C:/Downloads/part1.webm' });
+  await h.send('GET_DOWNLOAD_STATUS', { downloadId: first.downloadId });
+  await h.send('SEGMENT_SAVED', { recordingId: 'seg1', segmentIndex: 1,
+    historyEntry: { recordingId: 'seg1', filename: 'part1.webm', size: 100 } });
+  state = await h.send('GET_STATE');
+  ok('首段 complete 后才写历史与完成数', state.savedSegments === 1 && state.status === 'recording' &&
+    h.local.recordingHistory?.[0]?.recordingId === 'seg1' && state.downloadRecordingId === 'seg1');
+
+  await h.send('ENGINE_PROCESSING', { active: true, stage: 'webm-fix', scope: 'segment', segmentIndex: 2 });
+  const second = await h.send('SAVE_FILE', {
+    url: 'blob:chrome-extension://x/seg2', filename: 'part2.webm', recordingId: 'seg2', segmentIndex: 2,
+  });
+  const stale = await h.send('GET_DOWNLOAD_STATUS', { downloadId: first.downloadId });
+  state = await h.send('GET_STATE');
+  ok('下一段可创建新下载且旧事件不覆盖', !second.error && second.downloadId === 2 && state.downloadId === 2 &&
+    state.downloadRecordingId === 'seg2' && !!stale.error && state.status === 'recording',
+    JSON.stringify({ second, stale, state }));
+  h.patch(second.downloadId, { state: 'complete', bytesReceived: 100, filename: 'C:/Downloads/part2.webm' });
+  await h.send('GET_DOWNLOAD_STATUS', { downloadId: second.downloadId });
+  await h.send('SEGMENT_SAVED', { recordingId: 'seg2', segmentIndex: 2,
+    historyEntry: { recordingId: 'seg2', filename: 'part2.webm', size: 100 } });
+  ok('第二段完成历史独立且段号推进', h.local.recordingHistory?.length === 2 &&
+    (await h.send('GET_STATE')).savedSegments === 2);
+}
+
+{
+  const records = [
+    { ...recoveryMeta('session-1'), sessionId: 'session', segmentIndex: 1, phase: 'downloading', downloadId: 1 },
+    { ...recoveryMeta('session-2'), sessionId: 'session', segmentIndex: 2 },
+    { ...recoveryMeta('session-3'), sessionId: 'session', segmentIndex: 3 },
+  ];
+  const h = harness(null, records);
+  h.patch(1, { state: 'complete', filename: 'C:/Downloads/session-1.webm', bytesReceived: 100, totalBytes: 100 });
+  const recovered = [];
+  h.respondWith(async msg => {
+    if (msg.type === 'OFF_RECOVER_RECORDING') {
+      recovered.push(msg.metadata.id);
+      await new Promise(resolve => setImmediate(resolve));
+      return { ok: 1, historyEntry: { filename: `${msg.metadata.id}.webm`, recordingId: msg.metadata.id, size: 100 } };
+    }
+    return { ok: 1 };
+  });
+  await Promise.all([h.send('RECOVER_RECORDING'), h.send('RECOVER_RECORDING')]);
+  const state = await h.send('GET_STATE');
+  ok('多段按顺序恢复且不重复请求', recovered.join(',') === 'session-2,session-3', recovered.join(','));
+  ok('已有下载对账后只写一次历史且清空恢复态', h.local.recordingHistory?.length === 3 &&
+    state.recoveryAvailable === false && !h.local.durableRecordings?.length &&
+    new Set(h.local.recordingHistory.map(x => x.recordingId)).size === 3);
+  ok('恢复界面提供分段数量和总字节', state.recoveryCount === 0 && state.durableBytes === 0);
+}
+
+{
+  const records = [
+    { ...recoveryMeta('discard-1'), sessionId: 'discard', segmentIndex: 1, phase: 'downloading', downloadId: 1 },
+    { ...recoveryMeta('discard-2'), sessionId: 'discard', segmentIndex: 2 },
+    { ...recoveryMeta('discard-3'), sessionId: 'discard', segmentIndex: 3 },
+  ];
+  const h = harness(null, records);
+  h.patch(1, { state: 'complete', filename: 'C:/Downloads/discard-1.webm', bytesReceived: 100, totalBytes: 100 });
+  const discarded = [];
+  h.respondWith(async msg => {
+    if (msg.type === 'OFF_DISCARD_RECOVERY') discarded.push(msg.metadata.id);
+    return { ok: 1 };
+  });
+  await h.send('DISCARD_RECOVERY');
+  ok('明确丢弃保留下载文件但删除全部暂存副本', discarded.join(',') === 'discard-1,discard-2,discard-3' &&
+    !h.local.durableRecordings?.length, discarded.join(','));
+}
+
+{
+  const h = harness({ status: 'recording', mode: 'tab', segmented: true, processing: true,
+    savePhase: 'downloading', downloadId: 1, downloadRecordingId: 'seg1' });
+  h.patch(1, { state: 'in_progress', bytesReceived: 50, totalBytes: 100 });
+  const blocked = await h.send('SAVE_FILE', {
+    url: 'blob:chrome-extension://x/seg2', filename: 'part2.webm', recordingId: 'seg2', segmentIndex: 2,
+  });
+  ok('上一段真实下载进行中禁止新段并发', !!blocked.error);
+  h.patch(1, { state: 'complete', bytesReceived: 100, filename: 'C:/Downloads/part1.webm' });
+  const allowed = await h.send('SAVE_FILE', {
+    url: 'blob:chrome-extension://x/seg2', filename: 'part2.webm', recordingId: 'seg2', segmentIndex: 2,
+  });
+  ok('即使阶段被改写为 downloading 也按真实 complete 放行', !allowed.error && allowed.downloadId === 1,
+    JSON.stringify(allowed));
+}
+
+{
+  const h = harness({ status: 'recording', mode: 'tab', segmented: true, processing: true,
+    savePhase: 'downloading', downloadId: 2, downloadRecordingId: 'seg2' },
+    { ...recoveryMeta('seg1'), downloadId: 1 });
+  h.patch(1, { state: 'complete', bytesReceived: 100, filename: 'C:/Downloads/part1.webm' });
+  const result = await h.send('SEGMENT_SAVED', { recordingId: 'seg1', segmentIndex: 1,
+    historyEntry: { recordingId: 'seg1', filename: 'part1.webm', size: 100 } });
+  ok('旧段 saved 晚于新 downloadId 仍按本段 complete 记账', !result.error &&
+    h.local.recordingHistory?.[0]?.recordingId === 'seg1', JSON.stringify(result));
+}
+
+{
+  const h = harness({ status: 'idle', mode: 'tab', segmented: true, segmentIndex: 3,
+    savedSegments: 2, savingSegments: 1, processing: true, savePhase: 'downloading', downloadId: 3 });
+  await h.send('ENGINE_PROCESSING', { active: false, scope: 'segment', segmentIndex: 3 });
+  const state = await h.send('GET_STATE');
+  ok('最终段处理结束仍等待会话停止通知再解除忙态', state.processing === true && state.status === 'idle',
+    JSON.stringify(state));
+}
+
+{
+  const h = harness(null, [recoveryMeta('wanted')]);
+  h.respondWith(async msg => msg.type === 'OFF_RECOVER_RECORDING'
+    ? { ok: 1, historyEntry: { filename: 'other.webm', recordingId: 'other', size: 100 } }
+    : { ok: 1 });
+  const result = await h.send('RECOVER_RECORDING');
+  ok('恢复结果 ID 不匹配时拒绝清除真实暂存', !!result.error &&
+    h.local.durableRecordings?.[0]?.id === 'wanted' && !h.local.recordingHistory?.length,
+  JSON.stringify(result));
+}
+
+{
+  const recovered = [];
+  const deleted = [];
+  let listener;
+  const sandbox = {
+    console,
+    recoverDurableBlob: async metadata => {
+      recovered.push(metadata.id);
+      return { blob: new Blob(['media'], { type: 'video/webm' }), filename: `${metadata.id}.webm`, durMs: 1000 };
+    },
+    saveFileViaBackground: async (_blob, filename) => ({ filename, path: `C:/Downloads/${filename}` }),
+    deleteDurableFile: async metadata => { deleted.push(metadata.id); },
+    chrome: { runtime: {
+      onMessage: { addListener: fn => { listener = fn; } },
+      sendMessage: async () => ({ ok: 1 }),
+    } },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(ROOT, 'offscreen.js'), 'utf8'), sandbox, { filename: 'offscreen.js' });
+  async function recover(id) {
+    return new Promise((resolve, reject) => {
+      const asyncReply = listener({ type: 'OFF_RECOVER_RECORDING', target: 'offscreen', metadata: { id } }, {}, resolve);
+      if (!asyncReply) reject(new Error('恢复消息未异步回复'));
+    });
+  }
+  const first = await recover('part-one');
+  const second = await recover('part-two');
+  ok('连续恢复使用各自 ID 而不是复用首段结果', recovered.join(',') === 'part-one,part-two' &&
+    deleted.join(',') === 'part-one,part-two' && first.historyEntry.recordingId === 'part-one' &&
+    second.historyEntry.recordingId === 'part-two', JSON.stringify({ recovered, deleted, second }));
+}
+
+{
+  const h = harness({ status: 'recording', segmented: true, processing: true,
+    completedRecordingIds: ['history-a', 'history-b'] });
+  const originalGet = h.chrome.storage.local.get;
+  h.chrome.storage.local.get = async key => {
+    if (key !== 'recordingHistory') return originalGet(key);
+    const snapshot = structuredClone(await originalGet(key));
+    await new Promise(resolve => setImmediate(resolve));
+    return snapshot;
+  };
+  await Promise.all([
+    h.send('SEGMENT_SAVED', { recordingId: 'history-a', segmentIndex: 1,
+      historyEntry: { recordingId: 'history-a', filename: 'a.webm', size: 100 } }),
+    h.send('SEGMENT_SAVED', { recordingId: 'history-b', segmentIndex: 2,
+      historyEntry: { recordingId: 'history-b', filename: 'b.webm', size: 100 } }),
+  ]);
+  h.chrome.storage.local.get = originalGet;
+  const ids = (h.local.recordingHistory || []).map(entry => entry.recordingId).sort();
+  ok('并发分段完成不会覆盖历史', ids.join(',') === 'history-a,history-b', ids.join(','));
+  await h.send('SEGMENT_SAVED', { recordingId: 'history-a', segmentIndex: 1,
+    historyEntry: { recordingId: 'history-a', filename: 'a.webm', size: 100 } });
+  ok('重复完成事件仍按 recordingId 去重', h.local.recordingHistory.length === 2);
+}
+
+{
+  const h = harness({ status: 'recording', mode: 'tab', segmented: true, processing: true,
+    completedRecordingIds: ['seg1'] });
+  await h.send('ENGINE_PROCESSING', { active: true, scope: 'segment', recordingId: 'seg2',
+    segmentIndex: 2, sessionId: 'session-current', stage: 'webm-fix' });
+  await h.send('SEGMENT_SAVED', { recordingId: 'seg1', segmentIndex: 1, sessionId: 'session-current',
+    historyEntry: { recordingId: 'seg1', filename: 'part1.webm', size: 100 } });
+  let state = await h.send('GET_STATE');
+  ok('旧 saved 不清除新段保存状态', state.processing && state.savingSegments === 1,
+    JSON.stringify(state));
+  await h.send('ENGINE_PROCESSING', { active: false, scope: 'segment', recordingId: 'seg1',
+    segmentIndex: 1, sessionId: 'session-current' });
+  state = await h.send('GET_STATE');
+  const saved = await h.send('SAVE_FILE', { url: 'blob:chrome-extension://x/seg2',
+    filename: 'part2.webm', recordingId: 'seg2', segmentIndex: 2 });
+  ok('旧 processing:false 不影响新段下载', state.processing && state.savingSegments === 1 && !saved.error,
+    JSON.stringify({ state, saved }));
 }
 
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n下载状态测试全部通过 🎉');

@@ -46,9 +46,12 @@ function patch(file, anchor, replacement) {
 patch('background.js', `  switch (msg.type) {`, `  switch (msg.type) {
     case 'E2E_PAUSE_DOWNLOAD_ID':
       await chrome.storage.session.set({ e2ePauseDownloadId: true });
+      console.log('E2E_GATE_SET');
       return { ok: 1 };`);
 patch('background.js', `      if (generation !== state.saveGeneration) {
-        return { error: '保存任务已替换，忽略过期下载' };`, `      while ((await chrome.storage.session.get('e2ePauseDownloadId')).e2ePauseDownloadId) {
+        return { error: '保存任务已替换，忽略过期下载' };`, `      console.log('E2E_GATE_CHECK', msg.recordingId,
+        (await chrome.storage.session.get('e2ePauseDownloadId')).e2ePauseDownloadId);
+      while ((await chrome.storage.session.get('e2ePauseDownloadId')).e2ePauseDownloadId) {
         await new Promise(resolve => setTimeout(resolve, 50));
       }
       if (generation !== state.saveGeneration) {
@@ -58,7 +61,7 @@ let recoveryE2EEngine = null;
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg.type !== 'E2E_RECOVERY_START' || msg.target !== 'offscreen') return false;
   (async () => {
-    recoveryE2EEngine = createRecorderEngine({
+    recoveryE2EEngine = (msg.segmented ? createSegmentedRecorderEngine : createRecorderEngine)({
       getStream: async () => {
         const canvas = document.createElement('canvas');
         canvas.width = 320; canvas.height = 180;
@@ -87,9 +90,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
         return stream;
       },
       onEvent: (name, data) => onEvent(name, data),
-      saveFile: (blob, filename) => saveFileViaBackground(blob, filename),
+      saveFile: (blob, filename, extra) => saveFileViaBackground(blob, filename, extra),
     });
-    const started = await recoveryE2EEngine.start({ outputFormat: msg.outputFormat, quality: 1000000 });
+    const started = await recoveryE2EEngine.start({
+      outputFormat: msg.outputFormat, quality: 1000000, segmentMinutes: msg.segmentMinutes,
+    });
     return started ? { ok: 1 } : { error: 'start failed' };
   })().then(reply).catch(error => reply({ error: error.message }));
   return true;
@@ -114,6 +119,7 @@ const options = {
 async function launch() {
   const ctx = await chromium.launchPersistentContext(PROFILE, options);
   const sw = ctx.serviceWorkers()[0] || await ctx.waitForEvent('serviceworker', { timeout: 15000 });
+  sw.on('console', msg => console.log('[SW]', msg.text()));
   return { ctx, sw };
 }
 async function hardKill(ctx) {
@@ -131,6 +137,22 @@ async function hardKill(ctx) {
 }
 async function state(popup) {
   return await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_STATE' }));
+}
+async function waitSw(sw, predicate, timeout = RECORD_MS) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    if (await sw.evaluate(predicate)) return;
+    if (Date.now() > deadline) {
+      const diagnostic = await sw.evaluate(async () => ({
+        records: await durableStore.list(),
+        completedRecordingIds: state.completedRecordingIds,
+        status: state.status, processing: state.processing, savePhase: state.savePhase,
+        segmentIndex: state.segmentIndex, savedSegments: state.savedSegments,
+      }));
+      throw new Error(`等待恢复场景条件超时：${JSON.stringify(diagnostic)}`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
 }
 
 for (const format of process.env.E2E_RECOVERY_SCENARIOS ? [] : ['webm', 'mp4']) {
@@ -150,7 +172,7 @@ for (const format of process.env.E2E_RECOVERY_SCENARIOS ? [] : ['webm', 'mp4']) 
   }), format);
   if (!started || started.error) throw new Error(JSON.stringify(started));
   await new Promise(resolve => setTimeout(resolve, RECORD_MS));
-  const meta = await sw.evaluate(async () => (await chrome.storage.local.get('durableRecording')).durableRecording);
+  const meta = await sw.evaluate(async () => (await durableStore.list())[0]);
   ok(`${format} 录制中持续暂存`, meta && meta.bytes > 10000 && meta.phase === 'recording', JSON.stringify(meta));
   await hardKill(ctx);
 
@@ -196,8 +218,77 @@ for (const format of process.env.E2E_RECOVERY_SCENARIOS ? [] : ['webm', 'mp4']) 
   await ctx.close();
 }
 
-const scenarios = process.env.E2E_RECOVERY_SCENARIOS
-  ? process.env.E2E_RECOVERY_SCENARIOS.split(',') : ['offscreen', 'reload', 'discard', 'download-intent'];
+if (!process.env.E2E_RECOVERY_SCENARIOS || process.env.E2E_RECOVERY_SCENARIOS === 'segments') {
+  console.log('\n恢复场景：多分段强杀 → 重启 → 按段恢复');
+  for (const target of [PROFILE, DOWNLOADS]) fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(DOWNLOADS, { recursive: true });
+  let { ctx, sw } = await launch();
+  const extId = new URL(sw.url()).host;
+  await sw.evaluate(async () => {
+    await chrome.offscreen.createDocument({
+      url: 'offscreen.html', reasons: ['USER_MEDIA', 'AUDIO_PLAYBACK'],
+      justification: 'E2E segmented recording recovery',
+    });
+  });
+  // 直通引擎也必须具备正式 START 的会话归属，否则段级事件会被正确拒绝。
+  await sw.evaluate(() => setState({ segmented: true, status: 'recording', mode: 'tab' }));
+  await sw.evaluate(() => chrome.runtime.sendMessage({
+    type: 'E2E_RECOVERY_START', target: 'offscreen', outputFormat: 'webm',
+    segmented: true, segmentMinutes: 0.05,
+  }));
+  await waitSw(sw, () => state.completedRecordingIds.length >= 1);
+  // service worker 的 sendMessage 不会回投给自身，直接设置同一个测试门闩。
+  await sw.evaluate(() => chrome.storage.session.set({ e2ePauseDownloadId: true }));
+  ok('下载 ID 门闩已生效', await sw.evaluate(async () =>
+    (await chrome.storage.session.get('e2ePauseDownloadId')).e2ePauseDownloadId === true));
+  await waitSw(sw, async () => {
+    const records = await durableStore.list();
+    const pending = records.filter(record => !state.completedRecordingIds.includes(record.id));
+    return pending.length >= 2 && pending.every(record => record.bytes > 0);
+  });
+  const records = await sw.evaluate(() => durableStore.list());
+  const completedIds = await sw.evaluate(() => state.completedRecordingIds || []);
+  const pendingIds = records.filter(record => !completedIds.includes(record.id)).map(record => record.id);
+  ok('多分段同时有已完成记录与至少两个未下载段', pendingIds.length >= 2 && completedIds.length >= 1 &&
+    records.every(record => record.bytes > 0),
+  JSON.stringify({ pending: records.map(record => ({ segment: record.segmentIndex, bytes: record.bytes, phase: record.phase })),
+    completed: completedIds.length }));
+  await hardKill(ctx);
+
+  ({ ctx, sw } = await launch());
+  await sw.evaluate(() => chrome.storage.session.remove('e2ePauseDownloadId'));
+  const popup = await ctx.newPage();
+  await popup.goto(`chrome-extension://${extId}/popup.html`);
+  const recoveredState = await state(popup);
+  ok('多分段重启后显示数量和恢复入口', recoveredState.recoveryAvailable === true && recoveredState.recoveryCount >= 2,
+    JSON.stringify({ count: recoveredState.recoveryCount, bytes: recoveredState.durableBytes }));
+  const results = await Promise.all([
+    popup.evaluate(() => chrome.runtime.sendMessage({ type: 'RECOVER_RECORDING' })),
+    popup.evaluate(() => chrome.runtime.sendMessage({ type: 'RECOVER_RECORDING' })),
+  ]);
+  ok('多分段重复恢复互斥且全部成功', results.every(result => result?.ok === 1), JSON.stringify(results));
+  const files = fs.readdirSync(DOWNLOADS).filter(name => !name.endsWith('.crdownload'));
+  const history = await popup.evaluate(() => chrome.storage.local.get('recordingHistory')
+    .then(data => data.recordingHistory || []));
+  ok('每个未下载 recordingId 都有独立恢复历史', pendingIds.every(id =>
+    history.filter(entry => entry.recordingId === id).length === 1), JSON.stringify({ pendingIds, history }));
+  ok('多分段恢复产生全部文件', files.length >= 2, JSON.stringify(files));
+  for (const name of files) {
+    const file = path.join(DOWNLOADS, name);
+    const decode = spawnSync('ffmpeg', ['-v', 'warning', '-i', file, '-f', 'null', '-'], { encoding: 'utf8' });
+    ok(`分段 ${name} 完整解码`, decode.status === 0 && !decode.stderr.includes('File ended prematurely'), decode.stderr.trim());
+    const bytes = fs.readFileSync(file);
+    ok(`分段 ${name} 关键帧索引正确`, checkWebMKeyframeCues(bytes).errors.length === 0);
+  }
+  const after = await state(popup);
+  ok('全部分段完成后才清恢复状态', !after.recoveryAvailable && after.recoveryCount === 0 && after.savePhase === 'complete',
+    JSON.stringify(after));
+  await ctx.close();
+}
+
+const scenarios = (process.env.E2E_RECOVERY_SCENARIOS
+  ? process.env.E2E_RECOVERY_SCENARIOS.split(',') : ['offscreen', 'reload', 'discard', 'download-intent'])
+  .filter(name => name !== 'segments');
 for (const scenario of scenarios) {
   console.log(`\n恢复场景：${scenario}`);
   for (const target of [PROFILE, DOWNLOADS]) fs.rmSync(target, { recursive: true, force: true });
@@ -215,7 +306,7 @@ for (const scenario of scenarios) {
   }));
   await sw.evaluate(() => setState({ status: 'recording', mode: 'tab' }));
   await new Promise(resolve => setTimeout(resolve, Math.min(RECORD_MS, 6000)));
-  const meta = await sw.evaluate(async () => (await chrome.storage.local.get('durableRecording')).durableRecording);
+  const meta = await sw.evaluate(async () => (await durableStore.list())[0]);
   ok(`${scenario} 暂存已写入`, meta && meta.bytes > 10000);
 
   if (scenario === 'download-intent') {
@@ -225,7 +316,7 @@ for (const scenario of scenarios) {
     await sw.evaluate(() => chrome.runtime.sendMessage({ type: 'E2E_RECOVERY_STOP', target: 'offscreen' }));
     let intentSeen = false;
     for (let i = 0; i < 100; i++) {
-      const current = await sw.evaluate(async () => (await chrome.storage.local.get('durableRecording')).durableRecording);
+      const current = await sw.evaluate(async () => (await durableStore.list())[0]);
       const files = fs.readdirSync(DOWNLOADS).filter(name => !name.endsWith('.crdownload'));
       intentSeen = !!current?.downloadIntent && !current.downloadId && files.length > 0;
       if (intentSeen) break;

@@ -11,9 +11,12 @@
  *   C. 暂停态直接停止：Duration 不含暂停段
  *   D. 原生 MP4：faststart/fMP4 时长修补与真实下载
  *   E. 保存状态可见：延迟下载、popup 关闭、进度窗口恢复、失败重试与明确丢弃
+ *   F. WebM 多分段：重叠切换、暂停、popup 关闭、段级保存与真实历史
+ *   G. 原生 MP4 多分段：faststart、音视频与真实下载
  *
  * 产物校验不依赖 ffprobe，直接读二进制：EBML/SeekHead/关键帧 Cues/Duration、MP4 box/时长。
  * Windows 无 xdotool 时可设 E2E_MANUAL_SHORTCUT=1，在提示后真实按 Ctrl+Shift+E；
+ * E2E_SHORTCUT_WAIT_MS 可缩短按键等待（默认 60000ms）。
  * NATIVE_CHROME_BIN 单独指定品牌 Chrome 的原生 MP4 测试路径。
  */
 
@@ -81,8 +84,11 @@ const RELAY = expr =>
   `try{chrome.runtime.sendMessage({type:'E2E_LOG',msg:(${expr})}).catch(()=>{})}catch(_){};`;
 
 patch('core-recorder.js', `      recorder.onstop = () => onStopped();`,
-  `      recorder.onerror = e => { ${RELAY(`'recorder.onerror:'+(e.error&&e.error.name||e)`)} };
+  `      const e2ePreviousRecorderError = recorder.onerror;
+      recorder.onerror = e => { ${RELAY(`'recorder.onerror:'+(e.error&&e.error.name||e)`)}; e2ePreviousRecorderError?.call(recorder, e); };
       recorder.onstop = () => { ${RELAY(`'recorder.onstop'`)} onStopped(); };`);
+patch('segment-recorder.js', `      segmentMs = (Number.isFinite(minutes) && minutes > 0 ? minutes : 30) * 60000;`,
+  `      segmentMs = (Number.isFinite(minutes) && minutes > 0 ? minutes : 30) * 3000;`);
 patch('core-recorder.js', `          if (recorder && recorder.state !== 'inactive') stop();`,
   RELAY(`'track ended:'+t.kind+' rstate='+(recorder&&recorder.state)`) + '\n', { prepend: true });
 patch('core-recorder.js', `        recorder.stop();`,
@@ -112,17 +118,17 @@ patch('background.js', `  switch (msg.type) {`,
       const gate = await chrome.storage.session.get(['e2eSaveBlock', 'e2eSaveInterrupt']);
       return { block: !!gate.e2eSaveBlock, interrupt: !!gate.e2eSaveInterrupt };
     }`);
-patch('save-file.js', `      const started = await chrome.runtime.sendMessage({ type: 'SAVE_FILE', url, filename });`,
+patch('save-file.js', `      const started = await chrome.runtime.sendMessage({ type: 'SAVE_FILE', url, filename, ...extra });`,
   `      let gate = await chrome.runtime.sendMessage({ type: 'E2E_GET_SAVE_GATE' });
       if (gate?.interrupt) throw new Error('E2E_INTERRUPTED');
       while (gate?.block) {
         await new Promise(resolve => setTimeout(resolve, 50));
         gate = await chrome.runtime.sendMessage({ type: 'E2E_GET_SAVE_GATE' });
       }
-      const started = await chrome.runtime.sendMessage({ type: 'SAVE_FILE', url, filename });`);
+      const started = await chrome.runtime.sendMessage({ type: 'SAVE_FILE', url, filename, ...extra });`);
 
 // 注入后自检：语法坏掉会让 offscreen 整页失效且极难排查，这里直接 fail-fast
-for (const f of ['core-recorder.js', 'durable-recorder.js', 'durable-writer-worker.js', 'offscreen.js', 'recorder.js', 'background.js', 'popup.js', 'save-file.js', 'save-status.js']) {
+for (const f of ['core-recorder.js', 'segment-recorder.js', 'durable-store.js', 'durable-recorder.js', 'durable-writer-worker.js', 'offscreen.js', 'recorder.js', 'background.js', 'popup.js', 'save-file.js', 'save-status.js']) {
   execFileSync(process.execPath, ['--check', path.join(BUILD, f)]);
 }
 
@@ -259,26 +265,31 @@ await testPage.bringToFront();
 
 /** 按下 _execute_action 快捷键 → 等价用户点击扩展图标，完成 activeTab 调用授权。
     Linux 用 X11 xdotool；Windows 可设 E2E_MANUAL_SHORTCUT=1，留出真实按键窗口。
-    带重试：每次按键后直接探一次 getMediaStreamId 验证授权是否生效 */
+    带重试：Windows 在按键窗口内持续探测，授权一生效就继续，不空等固定时长 */
 async function invokeExtension() {
+  const granted = () => popup.evaluate(() => new Promise(res => {
+    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+      chrome.tabCapture.getMediaStreamId({ targetTabId: tabs[0] && tabs[0].id }, id => {
+        res(!!id && !chrome.runtime.lastError);
+      });
+    });
+  }));
   for (let attempt = 1; attempt <= 4; attempt++) {
     if (process.platform === 'win32') {
       if (!process.env.E2E_MANUAL_SHORTCUT) throw new Error('Windows 需要 X11 xdotool，或设置 E2E_MANUAL_SHORTCUT=1 后手动按 Ctrl+Shift+E');
-      console.log('  请在 60 秒内聚焦测试 Chrome 并按 Ctrl+Shift+E…');
+      const shortcutWaitMs = Number(process.env.E2E_SHORTCUT_WAIT_MS || 60000);
+      console.log(`  请在 ${shortcutWaitMs / 1000} 秒内聚焦测试 Chrome 并按 Ctrl+Shift+E…`);
       await testPage.bringToFront();
-      await sleep(60000);
+      const deadline = Date.now() + shortcutWaitMs;
+      while (Date.now() < deadline) {
+        await sleep(500);
+        if (await granted()) return;
+      }
     } else {
       execFileSync('xdotool', ['key', 'ctrl+shift+e']);
+      await sleep(1000);
+      if (await granted()) return;
     }
-    await sleep(1000);
-    const granted = await popup.evaluate(() => new Promise(res => {
-      chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-        chrome.tabCapture.getMediaStreamId({ targetTabId: tabs[0] && tabs[0].id }, id => {
-          res(!!id && !chrome.runtime.lastError);
-        });
-      });
-    }));
-    if (granted) return;
     console.log(`  …调用授权第 ${attempt} 次未生效，重试`);
   }
   throw new Error('activeTab 调用授权失败：扩展快捷键未生效');
@@ -297,6 +308,12 @@ const ui = {
     const f = document.getElementById('fmt');
     f.value = v; f.dispatchEvent(new Event('change'));
   }, String(v)),
+  setSegments: (enabled, minutes = 1) => popup.evaluate(({ enabled, minutes }) => {
+    const toggle = document.getElementById('segmentEnabled');
+    toggle.checked = enabled; toggle.dispatchEvent(new Event('change'));
+    const input = document.getElementById('segmentMinutes');
+    input.value = String(minutes); input.dispatchEvent(new Event('change'));
+  }, { enabled, minutes }),
   mp4NativeSupported: () => popup.evaluate(() =>
     ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a', 'video/mp4']
       .some(m => MediaRecorder.isTypeSupported(m))),   // 与生产 pickFormat 同一降级链
@@ -322,7 +339,8 @@ const ui = {
 // VM 软编码 VP9 可能远慢于实时，给足 90s；error 用于显式故障注入场景。
 const settleAfterStop = () =>
   waitBgState(s => s.status === 'idle' && !s.processing &&
-    (s.savePhase === 'complete' || s.savePhase === 'error'), '停止收尾完成', 90000);
+    (s.savePhase === 'error' || s.savePhase === 'complete' && !s.segmented && s.recoveryCount === 0),
+  '停止收尾、会话通知与暂存清理完成', 90000);
 
 async function waitSavePage(timeoutMs = 20000) {
   const t0 = Date.now();
@@ -540,6 +558,78 @@ try {
   await waitBgState(s => !s.processing && s.savePhase === '', '明确丢弃后归位');
   ok('明确丢弃不写历史且解除忙态', (await historyLength()) === historyBeforeE + 2);
   await setSaveGate(false, false);
+
+  /* ── 场景 F：同流重叠分段、暂停与 popup 关闭 ────────── */
+  console.log('\n场景 F：WebM 至少 3 段（暂停、popup 关闭、段级保存）');
+  const downloadsBeforeF = fs.readdirSync(DL_DIR);
+  const historyBeforeF = await historyLength();
+  await ui.setFormat('webm');
+  await ui.setCountdown(0);
+  await ui.setSegments(true, 1);
+  await ui.clickRec();
+  await waitBgState(s => s.status === 'recording', '分段录制开始');
+  await waitBgState(s => s.segmentIndex >= 2, '第二段开始', 60000);
+  await ui.clickPause();
+  await waitBgState(s => s.status === 'paused', '分段暂停');
+  const pausedSegment = await waitBgState(s => s.status === 'paused', '暂停段号稳定');
+  await sleep(1400);
+  const stillPaused = await waitBgState(s => s.status === 'paused', '暂停中不轮换');
+  ok('暂停期间不创建新段', stillPaused.segmentIndex === pausedSegment.segmentIndex,
+    `${pausedSegment.segmentIndex} -> ${stillPaused.segmentIndex}`);
+  await ui.clickPause();
+  await waitBgState(s => s.status === 'recording', '分段恢复');
+  await popup.close();
+  popup = await ctx.newPage();
+  await popup.goto(`chrome-extension://${extId}/popup.html`);
+  await popup.evaluate(() => {
+    window.__e2eLogs = [];
+    chrome.runtime.onMessage.addListener(msg => {
+      if (msg.type === 'E2E_LOG') window.__e2eLogs.push(Date.now() % 100000 + ' ' + msg.msg);
+    });
+  });
+  await waitBgState(s => s.segmentIndex >= 3 && s.savedSegments >= 2, '至少三段且两段已保存', 90000);
+  const segmentSaveState = await waitBgState(s => s.savingSegments > 0, '段级保存状态可见', 30000)
+    .catch(() => null);
+  if (segmentSaveState) {
+    const saveText = await popup.locator('#saveText').innerText();
+    ok('段级保存或完成状态清晰可见', saveText.includes('录制继续') || saveText.includes('已保存'), saveText);
+  }
+  await ui.clickRec();
+  await settleAfterStop();
+  const webmParts = fs.readdirSync(DL_DIR).filter(name => !downloadsBeforeF.includes(name) && !name.endsWith('.crdownload')).sort();
+  ok('WebM 至少三个独立分段', webmParts.length >= 3, webmParts.join(', '));
+  // 切换边界的最后一片可能不足 100ms；空 Blob 的拒绝由单元测试覆盖，不能用人为的 100ms 拒绝合法媒体。
+  for (const file of webmParts) checkWebM(path.join(DL_DIR, file), { minMs: 1, maxMs: 12000 });
+  const segmentHistory = await popup.evaluate(() => new Promise(resolve =>
+    chrome.storage.local.get('recordingHistory', d => resolve(d.recordingHistory || []))));
+  ok('每段 complete 后才写独立历史', segmentHistory.length >= historyBeforeF + 3,
+    `${historyBeforeF} -> ${segmentHistory.length}`);
+  await ui.setSegments(false);
+
+  console.log('\n场景 G：原生 MP4 至少 3 段');
+  if (!(await ui.mp4NativeSupported())) {
+    console.log('  ⚠️ 本 Chromium 不支持 MediaRecorder 原生 MP4，跳过');
+  } else {
+    const downloadsBeforeG = fs.readdirSync(DL_DIR);
+    await ui.setFormat('mp4');
+    await ui.setCountdown(0);
+    await ui.setSegments(true, 1);
+    await testPage.bringToFront();
+    const startG = await popup.evaluate(() => chrome.runtime.sendMessage({
+      type: 'START_RECORDING', source: 'tab', outputFormat: 'mp4',
+      segmentEnabled: true, segmentMinutes: 1, countdownSec: 0,
+    }));
+    ok('MP4 分段录制消息启动成功', !startG.error, JSON.stringify(startG));
+    await waitBgState(s => s.status === 'recording', 'MP4 分段录制开始');
+    await waitBgState(s => s.segmentIndex >= 3 && s.savedSegments >= 2, 'MP4 至少三段且两段已保存', 90000);
+    await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'STOP_RECORDING' }));
+    await settleAfterStop();
+    const mp4Parts = fs.readdirSync(DL_DIR).filter(name => !downloadsBeforeG.includes(name) && !name.endsWith('.crdownload')).sort();
+    ok('MP4 至少三个独立分段', mp4Parts.length >= 3, mp4Parts.join(', '));
+    for (const file of mp4Parts) checkMp4(path.join(DL_DIR, file), { minMs: 100, maxMs: 12000 });
+    await ui.setSegments(false);
+    await ui.setFormat('webm');
+  }
 
   console.log('探针轨迹:', JSON.stringify(await popup.evaluate(() => window.__e2eLogs)));
   console.log(failed === 0 ? '\n全部通过 🎉' : `\n${failed} 项失败 ❌`);

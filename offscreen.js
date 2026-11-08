@@ -43,7 +43,7 @@ function recoverRecording(metadata) {
     notify('RECOVERY_COMPLETE', { historyEntry: result.historyEntry });
     return result;
   })();
-  recoveryPromise.catch(() => { recoveryPromise = null; });
+  recoveryPromise = recoveryPromise.finally(() => { recoveryPromise = null; });
   return recoveryPromise;
 }
 
@@ -102,7 +102,8 @@ async function doStart(opts) {
   }
   opts.streamId = idMsg.streamId;
 
-  engine = createRecorderEngine({
+  const engineFactory = opts.segmentEnabled ? createSegmentedRecorderEngine : createRecorderEngine;
+  engine = engineFactory({
     // 取流返回后也可能代次已失效（取消/新启动落在 getUserMedia 期间）：
     // 立即停掉刚到手的流并抛错，绝不让它变成没人持有的孤儿录制
     getStream: async (o) => {
@@ -115,7 +116,7 @@ async function doStart(opts) {
     },
     onEvent: (name, data) => onEvent(name, data),
     releaseExtra: () => releaseAudioCtx(),
-    saveFile: (blob, filename) => saveFileViaBackground(blob, filename),
+    saveFile: (blob, filename, extra) => saveFileViaBackground(blob, filename, extra),
   });
 
   const ok = await engine.start(opts);
@@ -158,8 +159,16 @@ function onEvent(name, data) {
     case 'size':     notify('FILE_SIZE_UPDATE',  { size: data.bytes }); break;
     case 'durable':  return notifyCritical('DURABLE_UPDATE', { patch: data });
     case 'durablecleanup': return notifyCritical('DURABLE_CLEANUP', { id: data && data.id });
+    case 'segment':
+      if (data && data.phase === 'started') notify('SEGMENT_STARTED', { ...data });
+      if (data && data.phase === 'saved') notify('SEGMENT_SAVED', { ...data });
+      break;
     case 'processing':
-      notify('ENGINE_PROCESSING', { active: !!(data && data.active), stage: data && data.stage });
+      notify('ENGINE_PROCESSING', {
+        active: !!(data && data.active), stage: data && data.stage,
+        scope: data && data.scope, segmentIndex: data && data.segmentIndex,
+        recordingId: data && data.recordingId, sessionId: data && data.sessionId,
+      });
       break;
     case 'saveerror':
       notify('ENGINE_SAVE_ERROR', { message: data && data.message, canRetry: true });

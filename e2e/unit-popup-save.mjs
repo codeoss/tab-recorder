@@ -118,5 +118,17 @@ function popupWith(bg, responses = {}) {
   ok('恢复待处理时禁止新录制', test.el.rec.style.pointerEvents === 'none');
 }
 
+{
+  const { test } = popupWith({
+    status: 'recording', mode: 'tab', processing: true, segmented: true,
+    segmentIndex: 2, savingSegmentIndex: 1, savingSegments: 1,
+    savePhase: 'downloading', processingStage: 'download', saveCanRetry: true,
+    saveReceived: 25, saveTotal: 100,
+  });
+  await test.pollState();
+  ok('主弹窗显示段级保存且录制继续', test.el.saveText.textContent.includes('第 1 段') &&
+    test.el.saveText.textContent.includes('录制继续') && test.el.saveProgress.textContent.includes('25%'));
+}
+
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n主弹窗保存状态测试全部通过 🎉');
 process.exit(failed ? 1 : 0);

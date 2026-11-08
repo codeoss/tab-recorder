@@ -341,5 +341,38 @@ function successEvents(events) {
   ok('保存排队时间不计入录制时长', events.find(event => event.name === 'stopped')?.data?.historyEntry?.duration === '00:00:00');
 }
 
+{
+  async function resourceCase(manageResources) {
+    let stopped = false;
+    let released = 0;
+    const shared = { getTracks: () => [{ kind: 'video', addEventListener() {}, stop() { stopped = true; } }] };
+    const engine = createRecorderEngine({
+      getStream: async () => shared,
+      releaseExtra: () => { released++; },
+      manageResources,
+      saveFile: async () => ({ filename: 'resources.webm' }),
+    });
+    await engine.start({ outputFormat: 'webm' });
+    engine.stop();
+    await waitFor(() => !engine.isBusy());
+    return { stopped, released };
+  }
+  const owned = await resourceCase(undefined);
+  ok('默认停止仍释放媒体流与额外资源', owned.stopped && owned.released === 1);
+  const shared = await resourceCase(false);
+  ok('分段模式停止不释放共享资源', !shared.stopped && shared.released === 0);
+}
+
+{
+  const { engine, events } = engineWith(async () => ({ filename: 'media-error.webm' }));
+  await engine.start({ outputFormat: 'webm' });
+  lastRecorder.onerror?.({ error: { name: 'UnknownError', message: 'MEDIA_FATAL' } });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  ok('MediaRecorder error 可见并停止当前录制器', events.some(event =>
+    event.name === 'saveerror' && event.data?.message?.includes('MEDIA_FATAL')) &&
+    lastRecorder.state === 'inactive' && !engine.isBusy());
+  if (engine.isBusy()) await engine.discard();
+}
+
 console.log(failed ? `\n${failed} 项失败 ❌` : '\n保存引擎测试全部通过 🎉');
 process.exit(failed ? 1 : 0);
