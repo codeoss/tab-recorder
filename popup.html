@@ -72,7 +72,7 @@
     .sd{width:7px;height:7px;border-radius:50%;background:var(--t3);flex-shrink:0}
     .sd.rdy{background:var(--ok)}.sd.rec{background:var(--ac);animation:blink 1s infinite}.sd.pau{background:var(--wn)}
     @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-    .ir{display:flex;justify-content:space-between;margin-top:4px;font-size:10px;color:var(--t3);padding:0 4px}
+    .ir{display:flex;justify-content:space-between;margin:4px 0 14px;font-size:10px;color:var(--t3);padding:0 4px}
 
     .note{margin-top:4px;margin-bottom:4px;padding:8px 10px;background:rgba(83,82,237,.1);border:1px solid rgba(83,82,237,.2);border-radius:7px;font-size:11px;color:#7c7bf0;line-height:1.4}
 
@@ -96,6 +96,24 @@
   </div>
 
   <div class="ct">
+    <div class="ra">
+      <div class="tm" id="timer">00:00:00</div>
+      <div class="tm-sub hidden" id="limTxt"></div>
+      <div class="pw hidden" id="pWrap"><div class="pb" id="pBar"></div></div>
+      <button class="rb" id="recBtn"></button>
+      <div class="rl" id="recLabel">点击开始录制</div>
+      <div class="cb hidden" id="ctrls">
+        <button class="cbtn" id="pauseBtn">⏸ 暂停</button>
+        <button class="cbtn dg" id="discardBtn">🗑 丢弃</button>
+      </div>
+    </div>
+
+    <div class="sbar">
+      <span class="sd rdy" id="dot"></span>
+      <span id="stxt">就绪 — 关闭面板不影响录制</span>
+    </div>
+    <div class="ir"><span id="sizeInfo"></span><span id="fmtInfo">格式: WebM</span></div>
+
     <div id="sp">
       <div class="sl">录制来源</div>
       <div class="sg">
@@ -180,24 +198,6 @@
 
       <div class="note hidden" id="deskNote">录制窗口/屏幕时会弹出独立控制窗口，可以最小化该窗口</div>
     </div>
-
-    <div class="ra">
-      <div class="tm" id="timer">00:00:00</div>
-      <div class="tm-sub hidden" id="limTxt"></div>
-      <div class="pw hidden" id="pWrap"><div class="pb" id="pBar"></div></div>
-      <button class="rb" id="recBtn"></button>
-      <div class="rl" id="recLabel">点击开始录制</div>
-      <div class="cb hidden" id="ctrls">
-        <button class="cbtn" id="pauseBtn">⏸ 暂停</button>
-        <button class="cbtn dg" id="discardBtn">🗑 丢弃</button>
-      </div>
-    </div>
-
-    <div class="sbar">
-      <span class="sd rdy" id="dot"></span>
-      <span id="stxt">就绪 — 关闭面板不影响录制</span>
-    </div>
-    <div class="ir"><span id="sizeInfo"></span><span id="fmtInfo">格式: WebM</span></div>
 
     <div class="note hidden" id="savePanel" role="status">
       <div id="saveText"><b>正在保存</b></div>

@@ -1,11 +1,13 @@
 /**
- * 用真实 popup 脚本验证 desktop/compat 的准备、实际计时和控制入口。
+ * 用真实 popup 脚本验证 desktop/compat 的准备、实际计时和控制入口，
+ * 并在 Chromium 中检查主弹窗布局。
  * DOM/Chrome 仅替换外部边界，状态同步和界面行为均由生产代码执行。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
-import { fileURLToPath } from 'node:url';
+import { chromium } from 'playwright';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 let failed = 0;
@@ -178,5 +180,32 @@ for (const value of ['0', '1.5', '']) {
     h.test.el.fmt.value === 'mp4');
 }
 
-console.log(failed ? `\n${failed} 项失败 ❌` : '\n录制窗口状态测试全部通过 🎉');
+{
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 380, height: 900 } });
+    await page.addInitScript(() => {
+      window.chrome = {
+        storage: { local: { get: (_key, cb) => cb({}), set() {} } },
+        runtime: { sendMessage: async () => ({ status: 'idle', mode: 'tab', processing: false }) },
+      };
+    });
+    await page.goto(pathToFileURL(path.join(ROOT, 'popup.html')).href);
+    const layout = await page.evaluate(() => {
+      const sourceTop = document.getElementById('sp').getBoundingClientRect().top;
+      const blocks = [...document.querySelectorAll('.ra, .sbar, .ir')].map(node => {
+        const rect = node.getBoundingClientRect();
+        return { className: node.className, bottom: rect.bottom };
+      });
+      return { sourceTop, blocks };
+    });
+    ok('录制时间、按钮与状态区块位于录制来源上方',
+      layout.blocks.length === 3 && layout.blocks.every(block => block.bottom <= layout.sourceTop),
+      JSON.stringify(layout));
+  } finally {
+    await browser.close();
+  }
+}
+
+console.log(failed ? `\n${failed} 项失败 ❌` : '\n主弹窗状态与布局测试全部通过 🎉');
 process.exit(failed ? 1 : 0);
